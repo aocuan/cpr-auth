@@ -16,6 +16,8 @@ const DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const DEFAULT_OUT = "tmp/chatgpt-protocol-session.json";
 const DEFAULT_SUB2API_OUT = "tmp/sub2api-import-oauth.json";
+const DEFAULT_SESSION_OUT = "tmp/chatgpt-session.json";
+const DEFAULT_SESSION_COOKIES = "tmp/chatgpt-session-cookies.json";
 const DEFAULT_TOTP_RESULT = "tmp/chatgpt-totp-setup.json";
 const DEFAULT_PASSWORD_ADD_RESULT = "tmp/chatgpt-password-add-result.json";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -317,6 +319,14 @@ async function run() {
       });
       console.log(`[ok] Saved sub2api import: ${targetPath}`);
       console.log(`[ok] Refreshed OAuth account: ${refreshed.email || "<unknown>"}`);
+      await refreshChatgptSessionSnapshot({
+        authBase,
+        chatgptBase,
+        sessionOut: args.sessionOut,
+        cookiesOut: args.sessionCookies,
+        proxyTemplate,
+        transport,
+      });
       return;
     }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
@@ -615,6 +625,14 @@ async function run() {
       });
       console.log(`[ok] Saved session data: ${outPath}`);
     }
+
+    await saveChatgptSessionSnapshot({
+      client,
+      chatgptBase,
+      email,
+      sessionOut: args.sessionOut,
+      cookiesOut: args.sessionCookies,
+    });
 
     if (codex?.callbackUrl) {
       console.log("[ok] Codex callback URL:");
@@ -2134,6 +2152,54 @@ function createCheckpointWriter(checkpointPath, context) {
   };
 }
 
+async function saveChatgptSessionSnapshot({ client, chatgptBase, email, sessionOut, cookiesOut }) {
+  if (!sessionOut || !client) return false;
+  try {
+    const { data } = await client.getJson("GET", `${chatgptBase}/api/auth/session`, {
+      referer: `${chatgptBase}/`,
+      accept: "application/json",
+    });
+    await writePrivateJson(path.resolve(sessionOut), data);
+    if (cookiesOut) {
+      await writePrivateJson(path.resolve(cookiesOut), {
+        version: 1,
+        email: email || null,
+        chatgpt_base: chatgptBase,
+        updated_at: new Date().toISOString(),
+        cookies: client.jar.toJSON(),
+      });
+    }
+    console.log(`[ok] Updated ChatGPT session snapshot: ${path.resolve(sessionOut)}`);
+    return true;
+  } catch (error) {
+    console.log(`[warn] Could not update ChatGPT session snapshot: ${error.message}`);
+    return false;
+  }
+}
+
+async function refreshChatgptSessionSnapshot({ chatgptBase, sessionOut, cookiesOut, transport }) {
+  if (!sessionOut || !cookiesOut) return false;
+  try {
+    const stored = JSON.parse(await fs.readFile(path.resolve(cookiesOut), "utf8"));
+    if (!Array.isArray(stored.cookies)) throw new Error("session cookie file is invalid");
+    const client = new ProtocolClient({
+      verbose: false,
+      jar: CookieJar.fromJSON(stored.cookies),
+      transport,
+    });
+    return await saveChatgptSessionSnapshot({
+      client,
+      chatgptBase: stored.chatgpt_base || chatgptBase,
+      email: stored.email,
+      sessionOut,
+      cookiesOut,
+    });
+  } catch (error) {
+    console.log(`[warn] Could not refresh ChatGPT session snapshot: ${error.message}`);
+    return false;
+  }
+}
+
 async function readProtocolCheckpoint(checkpointPath) {
   const data = JSON.parse(await fs.readFile(checkpointPath, "utf8"));
   if (
@@ -2233,6 +2299,10 @@ function parseArgs(argv) {
     else if (item === "--out") args.out = argv[++i];
     else if (item.startsWith("--sub2api-out=")) args.sub2apiOut = item.slice("--sub2api-out=".length);
     else if (item === "--sub2api-out") args.sub2apiOut = argv[++i];
+    else if (item.startsWith("--session-out=")) args.sessionOut = item.slice("--session-out=".length);
+    else if (item === "--session-out") args.sessionOut = argv[++i];
+    else if (item.startsWith("--session-cookies=")) args.sessionCookies = item.slice("--session-cookies=".length);
+    else if (item === "--session-cookies") args.sessionCookies = argv[++i];
     else if (item.startsWith("--output-mode=")) args.outputMode = item.slice("--output-mode=".length);
     else if (item === "--output-mode") args.outputMode = argv[++i];
     else if (item === "--no-sub2api-export") args.noSub2apiExport = true;
@@ -2367,6 +2437,8 @@ Options:
   --password-add-result <file>    Private add-password result. Default: ${DEFAULT_PASSWORD_ADD_RESULT}
   --out <file>                    Output JSON path. Default: ${DEFAULT_OUT}
   --sub2api-out <file>            sub2api import JSON path. Default: ${DEFAULT_SUB2API_OUT}
+  --session-out <file>            ChatGPT /api/auth/session JSON path (private).
+  --session-cookies <file>        Private cookies used to refresh the session snapshot.
   --output-mode <mode>            both, session, or sub2api. Default: both
   --no-sub2api-export             Do not exchange OAuth code or write sub2api import JSON.
   --refresh-sub2api <file>        Refresh an existing sub2api OAuth file without email login.

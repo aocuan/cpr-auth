@@ -1626,6 +1626,19 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     }
   }
 
+  async function copySession() {
+    try {
+      const response = await fetch(`/api/jobs/${job.id}/session`, {
+        headers: { "x-console-token": token },
+      });
+      if (!response.ok) throw new Error((await response.json()).error || "获取 Session 失败");
+      await navigator.clipboard.writeText(await response.text());
+      onError("");
+    } catch (requestError) {
+      onError(requestError.message || "无法复制 Session");
+    }
+  }
+
   const inputConfig = getInputConfig(job.status, job.currentPhone);
   const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 
@@ -1745,6 +1758,16 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {job.canDownload && (
             <button type="button" className="download-button" onClick={download}>
               <Download size={16} />下载
+            </button>
+          )}
+          {job.canCopySession && (
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={copySession}
+              title={`复制最近更新的 ChatGPT Session：${formatDateTime(job.sessionUpdatedAt)}`}
+            >
+              <Copy size={16} />复制 Session
             </button>
           )}
           {job.canDownload && sub2apiUploadAvailable && (

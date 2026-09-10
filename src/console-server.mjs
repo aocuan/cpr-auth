@@ -33,6 +33,8 @@ const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
+const CHATGPT_SESSION_FILENAME = "chatgpt-session.json";
+const CHATGPT_SESSION_COOKIES_FILENAME = "chatgpt-session-cookies.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
@@ -531,7 +533,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logs|download|session|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -550,6 +552,10 @@ async function handleApi(req, res, requestUrl) {
   }
   if (req.method === "GET" && action === "download") {
     await downloadResult(res, job);
+    return;
+  }
+  if (req.method === "GET" && action === "session") {
+    await downloadChatgptSession(res, job);
     return;
   }
   if (req.method === "POST" && ["sms-number", "luban-number"].includes(action)) {
@@ -666,6 +672,8 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     lastOperationType: "initial_authorization",
     completedAt: null,
     outputPath,
+    sessionPath: path.join(outputDir, CHATGPT_SESSION_FILENAME),
+    sessionCookiesPath: path.join(outputDir, CHATGPT_SESSION_COOKIES_FILENAME),
     checkpointPath,
     totpResultPath,
     passwordAddResultPath,
@@ -820,6 +828,10 @@ function launchJob(job, options = {}) {
         job.outputPath,
         "--sub2api-out",
         job.outputPath,
+        "--session-out",
+        job.sessionPath,
+        "--session-cookies",
+        job.sessionCookiesPath,
         "--verbose",
       ]
     : mode === "totp_setup"
@@ -856,6 +868,10 @@ function launchJob(job, options = {}) {
         job.checkpointPath,
         "--resume-checkpoint",
         job.checkpointPath,
+        "--session-out",
+        job.sessionPath,
+        "--session-cookies",
+        job.sessionCookiesPath,
         "--verbose",
       ];
   const child = spawn(process.execPath, args, {
@@ -917,6 +933,9 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+    if (await fileExists(job.sessionPath)) {
+      job.sessionUpdatedAt = (await fs.stat(job.sessionPath)).mtime.toISOString();
+    }
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
     job.loginCheckpointAvailable = false;
     job.status = "completed";
@@ -2301,6 +2320,23 @@ async function downloadResult(res, job) {
   res.end(data);
 }
 
+async function downloadChatgptSession(res, job) {
+  if (!(await fileExists(job.sessionPath))) {
+    sendJson(res, 409, { error: "The ChatGPT session snapshot is not ready" });
+    return;
+  }
+  const data = await fs.readFile(job.sessionPath);
+  const safeEmail = job.email.replace(/[^a-zA-Z0-9@._+-]/g, "_");
+  res.writeHead(200, {
+    "content-type": "application/json; charset=utf-8",
+    "content-disposition": `attachment; filename="${safeEmail}-chatgpt-session.json"`,
+    "content-length": data.length,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  });
+  res.end(data);
+}
+
 async function downloadBatchResult(res, ids) {
   if (!Array.isArray(ids) || ids.length === 0) {
     throw httpError(400, "请至少选择一个已完成任务");
@@ -2973,6 +3009,8 @@ function publicJob(job) {
     completedAt: job.completedAt,
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
+    canCopySession: Boolean(job.sessionPath && job.sessionUpdatedAt),
+    sessionUpdatedAt: job.sessionUpdatedAt || null,
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
     autoEmailOtp: Boolean(job.mailApiUrl),
@@ -3269,6 +3307,8 @@ async function syncCompletedOutputs(force = false) {
       const checkpointPath = path.join(outputDir, LOGIN_CHECKPOINT_FILENAME);
       const totpResultPath = path.join(outputDir, TOTP_SETUP_RESULT_FILENAME);
       const passwordAddResultPath = path.join(outputDir, PASSWORD_ADD_RESULT_FILENAME);
+      const sessionPath = path.join(outputDir, CHATGPT_SESSION_FILENAME);
+      const sessionCookiesPath = path.join(outputDir, CHATGPT_SESSION_COOKIES_FILENAME);
       let metadata = {};
       try {
         metadata = JSON.parse(await fs.readFile(path.join(outputDir, JOB_META_FILENAME), "utf8"));
@@ -3308,6 +3348,8 @@ async function syncCompletedOutputs(force = false) {
           lastOperationType: metadata.last_operation_type || "initial_authorization",
           completedAt: metadata.completed_at || completedAt,
           outputPath,
+          sessionPath,
+          sessionCookiesPath,
           checkpointPath,
           totpResultPath,
           passwordAddResultPath,
@@ -3316,6 +3358,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: true,
+          sessionUpdatedAt: metadata.session_updated_at || (await fileExists(sessionPath) ? (await fs.stat(sessionPath)).mtime.toISOString() : null),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -3393,6 +3436,8 @@ async function syncCompletedOutputs(force = false) {
           lastOperationType: metadata.last_operation_type || "initial_authorization",
           completedAt: null,
           outputPath,
+          sessionPath,
+          sessionCookiesPath,
           checkpointPath,
           totpResultPath,
           passwordAddResultPath,
@@ -3409,6 +3454,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: false,
+          sessionUpdatedAt: metadata.session_updated_at || null,
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -4325,6 +4371,7 @@ async function saveJobMetadata(job) {
         prompt: job.prompt || null,
         last_error: job.lastError || null,
         result_saved: Boolean(job.resultSaved),
+        session_updated_at: job.sessionUpdatedAt || null,
         completed_at: job.completedAt || null,
         attempt: Number(job.attempt || 1),
         security_check_required: Boolean(job.securityCheckRequired),
