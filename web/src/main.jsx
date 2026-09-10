@@ -2166,7 +2166,7 @@ function normalizeSub2ApiSettings(value) {
       ? [stored.groupId]
       : [];
   return {
-    baseUrl: String(stored.baseUrl || ""),
+    baseUrl: String(stored.baseUrl || "http://sub2api:8080"),
     adminApiKey: String(stored.adminApiKey || ""),
     groupIds: [...new Set(rawGroupIds.map((id) => String(id).trim()).filter(Boolean))],
     proxyId: String(stored.proxyId || ""),

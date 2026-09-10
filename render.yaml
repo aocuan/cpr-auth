@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: tosub2
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /
+    disk:
+      name: tosub2-data
+      mountPath: /var/lib/tosub2/data
+      sizeGB: 1
+    envVars:
+      - key: ONBOARDING_HOST
+        value: 0.0.0.0
+      - key: ONBOARDING_OUTPUT_ROOT
+        value: /var/lib/tosub2/data
+      - key: TOSUB2_TLS_PROFILE
+        value: chrome
+      - key: CHATGPT_BASE
+        value: https://chatgpt.com
+      - key: AUTH_BASE
+        value: https://auth.openai.com
