@@ -1632,7 +1632,21 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         headers: { "x-console-token": token },
       });
       if (!response.ok) throw new Error((await response.json()).error || "获取 Session 失败");
-      await navigator.clipboard.writeText(await response.text());
+      const text = await response.text();
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand("copy");
+        textarea.remove();
+        if (!copied) throw new Error("浏览器拒绝复制，请使用 HTTPS 或手动复制");
+      }
       onError("");
     } catch (requestError) {
       onError(requestError.message || "无法复制 Session");
