@@ -2553,30 +2553,10 @@ async function exportSourceAccounts(res, ids) {
     if (job.hasTotpCredential && !totpSecret) {
       throw httpError(409, `${job.email} 的 2FA 密钥未能从系统安全凭据存储读取，请重新导入该账号资料`);
     }
-    if (password) {
-      const parts = [job.email, password];
-      if (job.mailRequestBody) parts.push(job.mailRequestBody);
-      else if (job.mailApiUrl) parts.push(job.mailApiUrl);
-      if (totpSecret) parts.push(totpSecret);
-      lines.push(parts.join("----"));
-      continue;
-    }
-    if (job.mailRequestBody) {
-      lines.push(totpSecret
-        ? `${job.email}----${job.mailRequestBody}----${totpSecret}`
-        : `${job.email}----${job.mailRequestBody}`);
-      continue;
-    }
-    if (job.mailApiUrl) {
-      lines.push(totpSecret
-        ? `${job.email}----${job.mailApiUrl}----${totpSecret}`
-        : `${job.email}----${job.mailApiUrl}`);
-      continue;
-    }
-    if (job.loginMode === "manual") {
+    if (!password && !job.mailRequestBody && !job.mailApiUrl && job.loginMode === "manual") {
       throw httpError(409, `${job.email} 是旧版本任务，原始登录资料未保存，请重新导入该账号资料后再导出`);
     }
-    lines.push(totpSecret ? `${job.email}--------${totpSecret}` : job.email);
+    lines.push(serializeSourceAccount({ ...job, password, totpSecret }));
   }
   const payload = Buffer.from(`\uFEFF${lines.join("\n")}\n`, "utf8");
   res.writeHead(200, {
@@ -2587,6 +2567,33 @@ async function exportSourceAccounts(res, ids) {
     "x-content-type-options": "nosniff",
   });
   res.end(payload);
+}
+
+function serializeSourceAccount(account) {
+  const { email, password, totpSecret, mailApiUrl, mailRequestBody } = account;
+  const mailSource = mailRequestBody || mailApiUrl;
+  const parts = [email];
+  if (password) parts.push(password);
+  if (mailSource) parts.push(mailSource);
+  if (totpSecret) {
+    if (!password && !mailSource) parts.push("");
+    parts.push(totpSecret);
+  }
+  const line = parts.join("----");
+  // TXT 没有转义协议，下载前验证字段可无损还原，避免静默改写密码或拆断请求体
+  let parsed;
+  try {
+    const entries = parseBatchEntries(line, mailRequestBody
+      ? { method: "POST", url: mailApiUrl }
+      : { method: "GET" });
+    if (entries.length === 1) parsed = entries[0];
+  } catch {}
+  if (!parsed || ["email", "password", "totpSecret", "mailApiUrl", "mailRequestBody"].some(
+    key => (parsed[key] || "") !== (account[key] || ""),
+  )) {
+    throw httpError(409, `${email} 的字段包含分隔歧义、换行或首尾空白，无法无损导出为当前 TXT 格式；未生成文件，原始资料保持不变`);
+  }
+  return line;
 }
 
 function publicJob(job) {
@@ -3574,6 +3581,12 @@ function parsePostMailAccountLine(line, lineNumber, requestConfig) {
   if (remaining.length >= 2) {
     const totpCandidates = remaining.filter((field) => isTotpSecretCandidate(field.value));
     if (totpCandidates.length === 1) totpField = totpCandidates[0];
+    else if (totpCandidates.length === 2
+      && fields.length === 4 && emailField.index === 0
+      && totpCandidates[0].index === 1 && totpCandidates[1].index === 3) {
+      // 标准导出顺序为邮箱、密码、请求体、2FA，密码也可能符合 Base32 字符集
+      totpField = totpCandidates[1];
+    }
   }
   const bodyAndPassword = remaining.filter((field) => field !== totpField);
   const recognizableBodies = bodyAndPassword.filter((field) => looksLikeEncodedMailRequestBody(field.value));
@@ -3720,16 +3733,15 @@ function parseAccountLineWithDelimiter(line, delimiter, lineNumber) {
     }
   } else if (totpCandidates.length > 1) {
     const conventionalPasswordTotp = delimiter.id.startsWith("hyphen-")
-      && split.separators.length === 2
-      && fields.length === 3
+      && ((fields.length === 3 && urls.length === 0)
+        || (fields.length === 4 && urls.length === 1 && urls[0].index === 2))
       && emailRange.start === 0
       && emailRange.end === 0
-      && urls.length === 0
       && totpCandidates.length === 2
       && totpCandidates[0].index === 1
-      && totpCandidates[1].index === 2;
+      && totpCandidates[1].index === fields.length - 1;
     if (!conventionalPasswordTotp) return null;
-    // A 16-character password can also look like Base32; in email----password----2FA, the final field is 2FA.
+    // 标准导出顺序中的最后一列为 2FA，不能把同样符合 Base32 的密码识别成第二个密钥
     totp = totpCandidates[1];
     totp.type = "totp";
     totpValue = totp.value;

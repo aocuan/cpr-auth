@@ -6,9 +6,15 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createCredentialStore } from "../src/credential-store.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-console-"));
+const sourceCredentials = createCredentialStore({
+  macRoot: path.join(outputRoot, "test-mac-credentials"),
+  linuxRoot: path.join(outputRoot, "credentials"),
+  windowsRoot: path.join(outputRoot, "app-data", "CPR Auth", "credentials"),
+});
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
 const cprPort = await findAvailablePort();
@@ -44,6 +50,7 @@ const child = spawn(process.execPath, [
     PROXY_CONNECTION_RETRY_BASE_MS: "1",
     SUB2API_AUTO_REPAIR_COOLDOWN_MS: "0",
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
+    LOCALAPPDATA: path.join(outputRoot, "app-data"),
   },
   stdio: ["ignore", "pipe", "pipe"],
   windowsHide: true,
@@ -122,6 +129,15 @@ try {
   });
   assert.equal(deletePostMailJobsResponse.status, 200, await deletePostMailJobsResponse.text());
 
+  await verifySourceExport(headers, {
+    email: "source-post-base32@example.com", password: "aBCD2345eFGH6723",
+    mailRequestBody: '{"mailbox_id":"synthetic"}', totpSecret: "JBSWY3DPEHPK3PXP",
+  }, 200);
+  await verifySourceExport(headers, {
+    email: "source-post-multiline@example.com", password: "test-password",
+    mailRequestBody: '{\n"mailbox_id":"synthetic"\n}',
+  }, 409);
+
   const forbiddenMailHeaderResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
     method: "POST",
     headers,
@@ -135,6 +151,17 @@ try {
     body: JSON.stringify({ config: { method: "GET", headers: {} } }),
   });
   assert.equal(resetMailRequestConfigResponse.status, 200, await resetMailRequestConfigResponse.text());
+
+  for (const [suffix, fields, status] of [
+    ["ordinary", { password: "普通-password", totpSecret: "JBSWY3DPEHPK3PXP" }, 200],
+    ["base32-mail-totp", { password: "aBCD2345eFGH6723", mailApiUrl: `${baseUrl}/api/bootstrap`, totpSecret: "JBSWY3DPEHPK3PXP" }, 200],
+    ["leading-hyphen", { password: "-password", totpSecret: "JBSWY3DPEHPK3PXP" }, 409],
+    ["trailing-hyphen", { password: "password-", totpSecret: "JBSWY3DPEHPK3PXP" }, 409],
+    ["edge-spaces", { password: " password " }, 409],
+    ["url-delimiter", { password: "password", mailApiUrl: `${baseUrl}/api/bootstrap?token=a----b`, totpSecret: "JBSWY3DPEHPK3PXP" }, 409],
+  ]) {
+    await verifySourceExport(headers, { email: `source-${suffix}@example.com`, ...fields }, status);
+  }
 
   const createdResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -796,6 +823,43 @@ try {
   await Promise.race([childExit, delay(2_000)]);
   await new Promise((resolve) => cpr.close(resolve));
   await fs.rm(outputRoot, { recursive: true, force: true });
+}
+
+async function verifySourceExport(headers, account, expectedStatus) {
+  const created = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST", headers, body: JSON.stringify(account),
+  });
+  assert.equal(created.status, 201);
+  const { job } = await created.json();
+  await waitForJob(headers, job.id, value => value.status === "completed");
+  const exported = await fetch(`${baseUrl}/api/jobs/export-source`, {
+    method: "POST", headers, body: JSON.stringify({ ids: [job.id] }),
+  });
+  const text = await exported.text();
+  assert.equal(exported.status, expectedStatus, account.email);
+  if (expectedStatus === 200) {
+    const imported = await fetch(`${baseUrl}/api/jobs/batch`, {
+      method: "POST", headers, body: JSON.stringify({ text }),
+    });
+    assert.equal(imported.status, 201, account.email);
+    const result = await imported.json();
+    assert.equal(result.jobs.length, 1);
+    assert.equal(result.jobs[0].email, account.email);
+    assert.equal(result.jobs[0].autoEmailOtp, Boolean(account.mailApiUrl || account.mailRequestBody));
+  } else {
+    assert.equal(exported.headers.get("content-disposition"), null);
+    assert.match(JSON.parse(text).error, /无法无损导出/);
+    for (const value of [account.password, account.totpSecret, account.mailApiUrl, account.mailRequestBody].filter(Boolean)) {
+      assert.ok(!text.includes(value), "错误响应不能包含凭据内容");
+    }
+  }
+  const stored = await sourceCredentials.load(account.email);
+  assert.equal(stored.password, account.password || "");
+  assert.equal(stored.totpSecret, account.totpSecret || "");
+  const deleted = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
+    method: "POST", headers, body: JSON.stringify({ ids: [job.id] }),
+  });
+  assert.equal(deleted.status, 200);
 }
 
 async function waitForJson(url) {
