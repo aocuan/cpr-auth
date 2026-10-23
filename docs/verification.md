@@ -8,6 +8,7 @@
 - `test/cpr-access.mjs`：生产页面访问密码、API 会话 token、健康检查与静态资源边界
 - `test/console-smoke.mjs`：保留授权任务回归，替换已移除的 Sub2API 集成为 CPR 手动同步与授权完成后的自动同步验证
 - `test/console-restore-shutdown-smoke.mjs`：恢复原授权任务，关停时取消未完成的 CPR 连接请求
+- `test/credential-store.mjs`：平台凭据隔离、批量子进程限流、Linux 密文重载、并发密钥初始化、账号绑定以及密钥丢失/损坏保护
 - 其余上游测试继续检查凭据存储、TLS、邮件与接码、密码/MFA 和工作区流程
 
 这些测试使用合成账号材料和模拟上游，不能证明真实上游授权成功或真实 CPR 账号可用。

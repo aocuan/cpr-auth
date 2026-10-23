@@ -101,11 +101,38 @@ try {
     proxyUrl: "",
   });
 
-  const unsupportedStore = createCredentialStore({ platform: "linux" });
-  await assert.rejects(
-    unsupportedStore.save(email, credentials),
-    (error) => error.status === 501 && error.message.includes("Windows DPAPI"),
-  );
+  const linuxRoot = path.join(tempRoot, "linux");
+  const linuxStore = createCredentialStore({ platform: "linux", linuxRoot });
+  assert.deepEqual(await linuxStore.load(email), { password: "", totpSecret: "", proxyUrl: "" });
+  await Promise.all(Array.from({ length: 12 }, (_, index) => linuxStore.save(`linux-${index}@example.com`, credentials)));
+  await linuxStore.save(email, credentials);
+  const reopened = createCredentialStore({ platform: "linux", linuxRoot });
+  assert.deepEqual(await reopened.load(email.toLowerCase()), credentials);
+  const linuxFiles = (await fs.readdir(linuxRoot)).filter(name => name.endsWith(".json"));
+  assert.equal(linuxFiles.length, 13);
+  const firstPath = path.join(linuxRoot, linuxFiles[0]);
+  const encrypted = await fs.readFile(firstPath, "utf8");
+  assert.equal(encrypted.includes(credentials.password), false);
+  assert.equal(encrypted.includes(credentials.proxyUrl), false);
+  if (process.platform !== "win32") assert.equal((await fs.stat(firstPath)).mode & 0o777, 0o600);
+  await linuxStore.save("bound@example.com", credentials);
+  const boundFile = (await fs.readdir(linuxRoot)).find(name => name.endsWith(".json") && !linuxFiles.includes(name));
+  await fs.writeFile(path.join(linuxRoot, boundFile), encrypted);
+  await assert.rejects(reopened.load("bound@example.com"), /无法解密/);
+  const keyPath = path.join(linuxRoot, "credential-key");
+  const originalKey = await fs.readFile(keyPath);
+  await fs.writeFile(keyPath, "invalid-key");
+  await assert.rejects(reopened.load(email), /密钥无效/);
+  await assert.rejects(reopened.save(email, updatedCredentials), /密钥无效/);
+  assert.equal(await fs.readFile(keyPath, "utf8"), "invalid-key");
+  await fs.unlink(keyPath);
+  await assert.rejects(reopened.load(email), /密钥缺失/);
+  await assert.rejects(reopened.save(email, updatedCredentials), /密钥缺失/);
+  await assert.rejects(fs.access(keyPath), error => error.code === "ENOENT");
+  await fs.writeFile(keyPath, originalKey, { mode: 0o600 });
+  assert.deepEqual(await reopened.load(email), credentials);
+  await reopened.delete(email);
+  assert.deepEqual(await reopened.load(email), { password: "", totpSecret: "", proxyUrl: "" });
 
   // 模拟批量恢复凭据：子进程资源受限，单次失败不能阻塞后续队列
   let active = 0;

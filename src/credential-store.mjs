@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { createFileCredentialStore } from "./file-credential-store.mjs";
 
 const KEYCHAIN_SERVICE = "com.local.cpr-auth.credentials";
 const MAC_CREDENTIAL_ROOT = path.join(os.homedir(), "Library", "Application Support", "CPR Auth", "credentials");
@@ -47,6 +48,7 @@ export function createCredentialStore(options = {}) {
   const macRoot = path.resolve(options.macRoot || process.env.TOSUB2_MAC_CREDENTIAL_ROOT || MAC_CREDENTIAL_ROOT);
   const securityRunner = limitRunnerConcurrency(MAX_CONCURRENT_CREDENTIAL_PROCESSES, options.securityRunner || runSecurity);
   const powerShellRunner = limitRunnerConcurrency(MAX_CONCURRENT_CREDENTIAL_PROCESSES, options.powerShellRunner || runPowerShell);
+  const linuxStore = platform === "linux" ? createFileCredentialStore(path.resolve(options.linuxRoot || process.env.CPR_AUTH_CREDENTIAL_ROOT || path.join(process.env.ONBOARDING_OUTPUT_ROOT || path.join(process.cwd(), "tmp", "chatgpt-onboarding-console"), "credentials"))) : null;
 
   return {
     async save(email, credentials) {
@@ -56,6 +58,7 @@ export function createCredentialStore(options = {}) {
         totpSecret: typeof credentials.totpSecret === "string" ? credentials.totpSecret : "",
         proxyUrl: typeof credentials.proxyUrl === "string" ? credentials.proxyUrl : "",
       });
+      if (linuxStore) { await linuxStore.save(email, payload); return; }
       if (platform === "darwin") {
         await saveMacCredential(macRoot, email, payload, securityRunner);
         return;
@@ -79,6 +82,10 @@ export function createCredentialStore(options = {}) {
     },
 
     async load(email) {
+      if (linuxStore) {
+        const payload = await linuxStore.load(email);
+        return payload === null ? emptyCredentials() : parseCredentialPayload(payload);
+      }
       if (platform === "darwin") {
         return loadMacCredential(macRoot, email, securityRunner);
       }
@@ -101,6 +108,7 @@ export function createCredentialStore(options = {}) {
     },
 
     async delete(email) {
+      if (linuxStore) { await linuxStore.delete(email); return; }
       if (platform === "darwin") {
         const result = await securityRunner([
           "delete-generic-password",

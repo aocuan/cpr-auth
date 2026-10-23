@@ -11,3 +11,10 @@
 - CPR Auth 对凭据文件目录、Keychain 服务名和 DPAPI 用途标识做了独立命名，避免与 toSub2 共用或删除彼此的凭据
 - 许可：MIT，原版权声明为 `Copyright (c) 2026 poxiao33`，完整声明保留在本仓库 LICENSE
 - 本项目另加批量并发、失败后队列继续处理、延迟邮箱响应和迟到产物的回归验证
+
+## DomenLee/toSub2
+
+- 来源：https://github.com/DomenLee/toSub2/blob/dd66b41a2a5d58ba3fc7b25eeeff4acc50726111/deploy/server/security.mjs
+- 适配文件：`src/file-credential-store.mjs`
+- 适配内容：Linux 的 AES-256-GCM 凭据文件、邮箱 AAD 绑定和原子替换；另补密钥并发初始化、丢失和损坏保护
+- 许可：MIT，原版权声明为 `Copyright (c) 2026 poxiao33`，完整声明保留在本仓库 LICENSE

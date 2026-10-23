@@ -12,4 +12,5 @@ __pycache__
 .env.*
 cpr-key
 cpr-state.enc
+credential-key
 web/dist

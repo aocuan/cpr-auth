@@ -16,4 +16,5 @@ job-meta.json
 .venv/
 cpr-key
 cpr-state.enc
+credential-key
 *.enc.*.tmp
