@@ -17,6 +17,7 @@ module.exports = {
     max_restarts: 20,
     min_uptime: "10s",
     kill_timeout: 15_000,
+    shutdown_with_message: true,
     time: true,
     env: {
       NODE_ENV: "production",

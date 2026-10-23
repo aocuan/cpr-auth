@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const useIpcShutdown = process.platform === "win32" || process.argv.includes("--ipc");
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-restore-"));
 const outputRoot = path.join(tempRoot, "output");
 const restoredId = "11111111-1111-4111-8111-111111111111";
@@ -135,7 +136,7 @@ const child = spawn(process.execPath, [
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
     TOSUB2_TLS_PROFILE: "chrome142",
   },
-  stdio: ["ignore", "pipe", "pipe"],
+  stdio: ["ignore", "pipe", "pipe", "ipc"],
   windowsHide: true,
 });
 
@@ -196,15 +197,16 @@ try {
     delay(3_000).then(() => { throw new Error("monitor request did not start"); }),
   ]);
   const shutdownStartedAt = Date.now();
-  child.kill("SIGTERM");
+  if (useIpcShutdown) child.send("shutdown");
+  else child.kill("SIGTERM");
   const exit = await Promise.race([childExit, delay(10_000).then(() => null)]);
-  assert.ok(exit, "console did not exit after SIGTERM");
+  assert.ok(exit, "console did not exit after the shutdown request");
   assert.equal(exit.code, 0, logs);
   assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending CPR connection request");
   const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
   assert.equal(metadata.status, "canceled");
   assert.equal(metadata.prompt, "流程已取消");
-  console.log("console restore and graceful shutdown tests passed");
+  console.log(`console restore and graceful shutdown tests passed (${useIpcShutdown ? "IPC" : "SIGTERM"})`);
 } finally {
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   await Promise.race([childExit, delay(2_000)]);

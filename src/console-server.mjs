@@ -4040,6 +4040,12 @@ function httpError(status, message) {
 
 process.on("SIGINT", () => void shutdown().catch(reportShutdownFailure));
 process.on("SIGTERM", () => void shutdown().catch(reportShutdownFailure));
+// Windows 由 PM2 通过 IPC 请求关闭，复用信号路径的任务取消与落盘逻辑
+if (process.connected) {
+  process.on("message", (message) => {
+    if (message === "shutdown") void shutdown().catch(reportShutdownFailure);
+  });
+}
 
 async function shutdown() {
   if (shutdownPromise) return shutdownPromise;
@@ -4060,6 +4066,7 @@ async function shutdown() {
     ]);
     await vite.close();
     await closeHttpServer(server);
+    if (process.connected) process.disconnect();
   })();
   return shutdownPromise;
 }

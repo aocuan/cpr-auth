@@ -7,7 +7,7 @@
 - `test/cpr-connector.mjs`：受控 HTTP 服务验证请求字段、分组代理映射、Key 不回显与加密落盘、并发去重、重启恢复、断线结果未知、明确拒绝后的重试与过期任务保护
 - `test/cpr-access.mjs`：生产页面访问密码、API 会话 token、健康检查与静态资源边界
 - `test/console-smoke.mjs`：保留授权任务回归，替换已移除的 Sub2API 集成为 CPR 手动同步与授权完成后的自动同步验证
-- `test/console-restore-shutdown-smoke.mjs`：恢复原授权任务，关停时取消未完成的 CPR 连接请求
+- `test/console-restore-shutdown-smoke.mjs`：恢复原授权任务，关停时取消未完成的 CPR 连接请求，等待任务取消状态落盘后正常退出；Windows 使用 PM2 的 IPC shutdown 消息，其他平台使用 SIGTERM，可加 `--ipc` 验证消息路径
 - `test/credential-store.mjs`：平台凭据隔离、批量子进程限流、Linux 密文重载、并发密钥初始化、账号绑定以及密钥丢失/损坏保护
 - 其余上游测试继续检查凭据存储、TLS、邮件与接码、密码/MFA 和工作区流程
 
@@ -21,10 +21,12 @@
 
 本机 `npm run build`、指定隔离 Python 解释器的 `npm run check` 与 `npm audit --omit=dev` 已通过。Docker 构建因本机 Docker daemon 未运行而未执行成功，不能据此认定镜像可用。
 
+GitHub Actions 在 Linux 和 Windows 上执行构建与完整自动化回归，具体结果以[对应提交的运行记录](https://github.com/aocuan/cpr-auth/actions)为准。本机也已分别验证 SIGTERM 与 IPC 两种关闭路径。PM2 配置按[官方 Windows 关闭约定](https://pm2.io/docs/runtime/best-practices/graceful-shutdown/)启用 `shutdown_with_message`。
+
 ## 仍需实际环境验收
 
 - 使用测试账号完成真实登录、验证码与授权
 - 使用目标 CPR 版本完成真实入库并核对上游身份、分组、代理和凭据刷新
 - 验证真实代理出口与上游网络可达性
 - 在目标服务器验证 HTTPS、备份恢复、访问控制和长期运行
-- 验证 Windows 平台运行；本机验证平台为 macOS
+- Windows 人工操作与目标机器的 PM2 生命周期验收；本机浏览器验证平台为 macOS
