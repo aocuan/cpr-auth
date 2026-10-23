@@ -32,13 +32,13 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import { CprPanel, CprStatus, cprRequest } from "./CprPanel.jsx";
 
 const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
 const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const MAIL_REQUEST_SETTINGS_KEY = "chatgpt-onboarding.mail-request-settings-v1";
-const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
@@ -87,31 +87,11 @@ function App() {
   const [mailRequestSettingsOpen, setMailRequestSettingsOpen] = useState(false);
   const [mailRequestSettingsError, setMailRequestSettingsError] = useState("");
   const [mailRequestSettingsSaving, setMailRequestSettingsSaving] = useState(false);
-  const [sub2apiSettings, setSub2apiSettings] = useState(readSub2ApiSettings);
-  const [sub2apiSettingsDraft, setSub2apiSettingsDraft] = useState(readSub2ApiSettings);
-  const [sub2apiGroups, setSub2apiGroups] = useState([]);
-  const [sub2apiProxies, setSub2apiProxies] = useState([]);
-  const [sub2apiSettingsOpen, setSub2apiSettingsOpen] = useState(false);
-  const [sub2apiSettingsError, setSub2apiSettingsError] = useState("");
-  const [sub2apiGroupsLoading, setSub2apiGroupsLoading] = useState(false);
-  const [sub2apiSettingsSaving, setSub2apiSettingsSaving] = useState(false);
-  const [sub2apiMonitorChecking, setSub2apiMonitorChecking] = useState(false);
-  const [sub2apiMonitorStatus, setSub2apiMonitorStatus] = useState({
-    configured: false,
-    enabled: false,
-    running: false,
-    lastCheckAt: null,
-    nextCheckAt: null,
-    lastError: null,
-    lastResult: null,
-    intervalMinutes: 5,
-  });
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
-  useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
 
   useEffect(() => {
@@ -170,26 +150,6 @@ function App() {
       window.clearTimeout(timer);
     };
   }, [token, page, emailFilter]);
-
-  useEffect(() => {
-    if (!token || !features.sub2apiMonitor) return undefined;
-    let stopped = false;
-    const load = async () => {
-      try {
-        const data = await apiFetch(token, "/api/sub2api/monitor");
-        if (!stopped) {
-          setSub2apiMonitorStatus(data);
-          setSub2apiSettings((current) => ({ ...current, monitorEnabled: Boolean(data.enabled) }));
-        }
-      } catch {}
-    };
-    void load();
-    const timer = window.setInterval(load, 5_000);
-    return () => {
-      stopped = true;
-      window.clearInterval(timer);
-    };
-  }, [token, features.sub2apiMonitor]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
   const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
@@ -260,116 +220,15 @@ function App() {
     }
   }
 
-  function openSub2ApiSettings() {
-    setSub2apiSettingsDraft({ ...sub2apiSettings, monitorEnabled: Boolean(sub2apiMonitorStatus.enabled) });
-    setSub2apiSettingsError("");
-    setSub2apiSettingsOpen(true);
-  }
-
-  async function loadSub2ApiOptions(settings = sub2apiSettingsDraft) {
-    setSub2apiGroupsLoading(true);
-    setSub2apiSettingsError("");
-    try {
-      const data = await apiFetch(token, "/api/sub2api/options", {
-        method: "POST",
-        body: JSON.stringify({ config: settings }),
-      });
-      setSub2apiGroups(Array.isArray(data.groups) ? data.groups : []);
-      setSub2apiProxies(Array.isArray(data.proxies) ? data.proxies : []);
-    } catch (requestError) {
-      setSub2apiGroups([]);
-      setSub2apiProxies([]);
-      setSub2apiSettingsError(requestError.message);
-    } finally {
-      setSub2apiGroupsLoading(false);
-    }
-  }
-
-  async function saveSub2ApiSettings(event) {
-    event.preventDefault();
-    const baseUrl = String(sub2apiSettingsDraft.baseUrl || "").trim();
-    const adminApiKey = String(sub2apiSettingsDraft.adminApiKey || "").trim();
-    if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
-      setSub2apiSettingsError("请输入 http:// 或 https:// 开头的 Sub2API 后端地址");
-      return;
-    }
-    if (!adminApiKey) {
-      setSub2apiSettingsError("请输入 Sub2API 管理员 API Key");
-      return;
-    }
-    const nextSettings = {
-      ...readSub2ApiSettings(sub2apiSettingsDraft),
-      baseUrl: baseUrl.replace(/\/+$/, ""),
-      adminApiKey,
-    };
-    setSub2apiSettingsSaving(true);
-    try {
-      const monitor = await apiFetch(token, "/api/sub2api/monitor", {
-        method: "POST",
-        body: JSON.stringify({ enabled: nextSettings.monitorEnabled, config: nextSettings }),
-      });
-      setSub2apiSettings(nextSettings);
-      setSub2apiMonitorStatus(monitor);
-      setSub2apiSettingsOpen(false);
-      setSub2apiSettingsError("");
-    } catch (requestError) {
-      setSub2apiSettingsError(requestError.message);
-    } finally {
-      setSub2apiSettingsSaving(false);
-    }
-  }
-
-  async function checkSub2ApiMonitorNow() {
-    if (!sub2apiMonitorStatus.enabled || sub2apiMonitorChecking) return;
-    setSub2apiMonitorChecking(true);
-    setSub2apiSettingsError("");
-    try {
-      const data = await apiFetch(token, "/api/sub2api/monitor/check", { method: "POST" });
-      setSub2apiMonitorStatus(data);
-      setUploadNotice(formatMonitorResult(data.result));
-      setError("");
-    } catch (requestError) {
-      if (sub2apiSettingsOpen) setSub2apiSettingsError(requestError.message);
-      else setError(requestError.message);
-    } finally {
-      setSub2apiMonitorChecking(false);
-    }
-  }
-
-  function setSub2ApiGroupChecked(groupId, checked) {
-    setSub2apiSettingsDraft((current) => {
-      const selected = new Set(current.groupIds);
-      if (checked) selected.add(String(groupId));
-      else selected.delete(String(groupId));
-      return { ...current, groupIds: [...selected] };
-    });
-  }
-
   async function uploadSelected(ids) {
-    if (!sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey) {
-      openSub2ApiSettings();
-      setUploadNotice("请先配置 Sub2API 后端地址、管理员 API Key 和目标号池");
-      return;
-    }
     if (batchAction) return;
-    setBatchAction("upload");
-    setUploadNotice("");
+    setBatchAction("upload"); setUploadNotice("");
     try {
-      const data = await apiFetch(token, "/api/sub2api/upload", {
-        method: "POST",
-        body: JSON.stringify({ ids, config: sub2apiSettings }),
-      });
-      const result = data.result || {};
-      const created = result.account_created ?? result.success ?? data.uploaded;
-      const failed = result.account_failed ?? result.failed ?? 0;
-      setUploadNotice(`已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`);
-      setSelectedJobIds(new Set());
+      const data = await cprRequest(token, "sync", { ids });
+      setUploadNotice(data.results.map(result => result.message || "该任务未同步").join("；"));
       setError("");
-    } catch (requestError) {
-      setError(requestError.message);
-    } finally {
-      setBatchAction("");
-    }
+    } catch (error) { setError(error.message); }
+    finally { setBatchAction(""); }
   }
 
   async function loadSmsNumberOptions(settings = smsSettingsDraft) {
@@ -702,8 +561,8 @@ function App() {
         <div className="brand-block">
           <div className="brand-mark"><ShieldCheck size={21} strokeWidth={2.2} /></div>
           <div>
-            <h1>ChatGPT 账号授权控制台</h1>
-            <p>本地多任务协议登录</p>
+            <h1>CPR Auth</h1>
+            <p>Codex Proxy RS 账号授权与同步</p>
           </div>
         </div>
         <div className="summary" aria-label="任务统计">
@@ -785,42 +644,7 @@ function App() {
           </button>
         </div>
 
-        <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 配置与号池监控">
-          <div className="provider-heading"><Send size={17} /><strong>Sub2API</strong></div>
-          <span className="provider-name">{sub2apiSettings.baseUrl || "未配置后端"}</span>
-          <span className={`provider-ready ${sub2apiSettings.adminApiKey ? "" : "incomplete"}`}>
-            {sub2apiSettings.adminApiKey ? <Check size={14} /> : <CircleAlert size={14} />}
-            {sub2apiSettings.adminApiKey
-              ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""}`
-              : "未完成配置"}
-          </span>
-          {features.sub2apiMonitor && (
-            <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.enabled ? "" : "incomplete"}`}>
-              {sub2apiMonitorStatus.running
-                ? <LoaderCircle className="spin" size={14} />
-                : sub2apiMonitorStatus.enabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
-              {sub2apiMonitorStatus.running
-                ? "正在巡检"
-                : sub2apiMonitorStatus.enabled
-                  ? `号池监控已启用${sub2apiMonitorStatus.lastCheckAt ? ` · ${formatRelativeMonitorTime(sub2apiMonitorStatus.lastCheckAt)}` : ""}`
-                  : "号池监控未启用"}
-            </span>
-          )}
-          {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
-            <button
-              type="button"
-              className="icon-button monitor-check-button"
-              onClick={checkSub2ApiMonitorNow}
-              disabled={sub2apiMonitorChecking || sub2apiMonitorStatus.running}
-              title="立即检查 Sub2API 异常账号"
-            >
-              <RefreshCw className={sub2apiMonitorChecking || sub2apiMonitorStatus.running ? "spin" : ""} size={16} />
-            </button>
-          )}
-          <button type="button" className="secondary-button provider-settings-button" onClick={openSub2ApiSettings} disabled={!token}>
-            <Settings2 size={16} />配置
-          </button>
-        </div>
+        <CprPanel token={token} />
 
         <div className="provider-toolbar account-proxy-toolbar" aria-label="代理 IP 配置">
           <div className="provider-heading"><Globe2 size={17} /><strong>代理 IP</strong></div>
@@ -840,15 +664,7 @@ function App() {
             {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
             {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
           </span>
-          <a
-            className="provider-external-link"
-            href="https://invite.zooproxy.com/share/ez2v2jdb7"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <ExternalLink size={13} aria-hidden="true" />
-            点击获取代理 IP
-          </a>
+
         </div>
 
         {error && (
@@ -893,10 +709,10 @@ function App() {
                 {batchAction === "download" ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}
                 批量下载
               </button>
-              {features.sub2apiUpload && (
+              {features.cprSync && (
                 <button type="button" className="secondary-button bulk-button" onClick={() => uploadSelected([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
                   {batchAction === "upload" ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
-                  上传到 Sub2API
+                  同步到 CPR
                 </button>
               )}
               {features.sourceExport && (
@@ -972,7 +788,7 @@ function App() {
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
-                    sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
+                    cprSyncAvailable={Boolean(features.cprSync)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
@@ -1207,188 +1023,7 @@ function App() {
           </form>
         </div>
       )}
-      {sub2apiSettingsOpen && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
-          if (event.target === event.currentTarget) setSub2apiSettingsOpen(false);
-        }}>
-          <form className="batch-dialog sub2api-settings-dialog" onSubmit={saveSub2ApiSettings} role="dialog" aria-modal="true" aria-labelledby="sub2api-settings-title">
-            <div className="dialog-header">
-              <div>
-                <h2 id="sub2api-settings-title">Sub2API 配置</h2>
-                <span>管理员 Key 不写入任务文件或日志；启用监控后由本机服务保存</span>
-              </div>
-              <button type="button" className="icon-button" onClick={() => setSub2apiSettingsOpen(false)} title="关闭"><X size={18} /></button>
-            </div>
-            <div className="provider-config-grid sub2api-config-grid">
-              <label className="settings-field wide-settings-field">
-                <span>Sub2API 后端地址</span>
-                <input
-                  type="url"
-                  value={sub2apiSettingsDraft.baseUrl}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, baseUrl: event.target.value }))}
-                  placeholder="例如 http://127.0.0.1:8080"
-                  autoComplete="url"
-                />
-              </label>
-              {features.sub2apiMonitor && (
-                <label className="settings-field wide-settings-field sub2api-monitor-toggle">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(sub2apiSettingsDraft.monitorEnabled)}
-                    onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, monitorEnabled: event.target.checked }))}
-                  />
-                  <span>
-                    <strong>每 5 分钟监控异常账号</strong>
-                    <small>只自动处理上次完整登录未人工输入密码、邮箱码或登录 2FA 的任务</small>
-                  </span>
-                </label>
-              )}
-              <label className="settings-field wide-settings-field">
-                <span>管理员 API Key</span>
-                <input
-                  type="password"
-                  value={sub2apiSettingsDraft.adminApiKey}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, adminApiKey: event.target.value }))}
-                  placeholder="输入 sub2api 管理员 API Key"
-                  autoComplete="off"
-                />
-              </label>
-              <fieldset className="settings-field wide-settings-field sub2api-group-field">
-                <legend>目标号池（可多选）</legend>
-                <section className="sub2api-group-picker" aria-label="目标号池">
-                  {sub2apiGroups.length ? sub2apiGroups.map((group) => {
-                    const groupId = String(group.id);
-                    return (
-                      <label key={group.id} className="sub2api-group-option">
-                        <input
-                          type="checkbox"
-                          checked={sub2apiSettingsDraft.groupIds.includes(groupId)}
-                          onChange={(event) => setSub2ApiGroupChecked(groupId, event.target.checked)}
-                        />
-                        <span>{group.name}</span>
-                        <small>ID: {group.id}</small>
-                      </label>
-                    );
-                  }) : <div className="sub2api-group-empty">暂无可选号池</div>}
-                </section>
-                <section className="sub2api-group-selection" aria-label="号池选择操作">
-                  <span>已选 {sub2apiSettingsDraft.groupIds.length} 个</span>
-                  <button
-                    type="button"
-                    onClick={() => setSub2apiSettingsDraft((current) => ({ ...current, groupIds: sub2apiGroups.map((group) => String(group.id)) }))}
-                    disabled={!sub2apiGroups.length || sub2apiGroups.every((group) => sub2apiSettingsDraft.groupIds.includes(String(group.id)))}
-                  >
-                    全选
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSub2apiSettingsDraft((current) => ({ ...current, groupIds: [] }))}
-                    disabled={!sub2apiSettingsDraft.groupIds.length}
-                  >
-                    清空
-                  </button>
-                </section>
-              </fieldset>
-              <label className="settings-field wide-settings-field">
-                <span>代理 IP</span>
-                <select
-                  value={sub2apiSettingsDraft.proxyId}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, proxyId: event.target.value }))}
-                >
-                  <option value="">使用账号原配置</option>
-                  {sub2apiProxies.map((proxy) => <option key={proxy.id} value={String(proxy.id)}>{formatSub2ApiProxy(proxy)}</option>)}
-                </select>
-              </label>
-              <label className="settings-field wide-settings-field">
-                <span>Codex 指纹收敛</span>
-                <select
-                  value={sub2apiSettingsDraft.codexFingerprintMode}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, codexFingerprintMode: event.target.value }))}
-                >
-                  <option value="off">关闭（透传）</option>
-                  <option value="device">仅设备</option>
-                  <option value="session">设备+会话（推荐）</option>
-                  <option value="full">完全收敛</option>
-                </select>
-              </label>
-              <label className="settings-field">
-                <span>并发数</span>
-                <input
-                  type="number"
-                  min="0"
-                  max="10000"
-                  step="1"
-                  value={sub2apiSettingsDraft.concurrency}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, concurrency: event.target.value }))}
-                  placeholder="留空使用账号原值"
-                />
-              </label>
-              <label className="settings-field">
-                <span>负载因子</span>
-                <input
-                  type="number"
-                  min="0"
-                  max="10000"
-                  step="1"
-                  value={sub2apiSettingsDraft.loadFactor}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, loadFactor: event.target.value }))}
-                  placeholder="留空使用账号原值"
-                />
-              </label>
-              <label className="settings-field">
-                <span>优先级</span>
-                <input
-                  type="number"
-                  min="0"
-                  max="10000"
-                  step="1"
-                  value={sub2apiSettingsDraft.priority}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, priority: event.target.value }))}
-                  placeholder="留空使用账号原值"
-                />
-              </label>
-              <label className="settings-field wide-settings-field">
-                <span>允许使用的模型</span>
-                <textarea
-                  className="sub2api-model-textarea"
-                  value={sub2apiSettingsDraft.modelWhitelist}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, modelWhitelist: event.target.value }))}
-                  placeholder={"每行一个模型，也支持逗号分隔，例如：\ngpt-5\ngpt-5-mini\ngpt-4.1"}
-                  rows="5"
-                  spellCheck="false"
-                />
-              </label>
-            </div>
-            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。</div>
-            {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
-              <div className={`sub2api-monitor-status ${sub2apiMonitorStatus.lastError ? "error" : ""}`}>
-                <ShieldCheck size={15} />
-                <span>{sub2apiMonitorStatus.lastError
-                  ? `上次巡检失败：${sub2apiMonitorStatus.lastError}`
-                  : sub2apiMonitorStatus.lastCheckAt
-                    ? formatMonitorResult(sub2apiMonitorStatus.lastResult)
-                    : "尚未执行号池巡检"}</span>
-              </div>
-            )}
-            {sub2apiSettingsError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{sub2apiSettingsError}</div>}
-            <div className="dialog-actions sub2api-dialog-actions">
-              <button type="button" className="secondary-button" onClick={() => loadSub2ApiOptions()} disabled={sub2apiGroupsLoading || !token}>
-                {sub2apiGroupsLoading ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}读取配置
-              </button>
-              {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
-                <button type="button" className="secondary-button" onClick={checkSub2ApiMonitorNow} disabled={sub2apiMonitorChecking || sub2apiMonitorStatus.running}>
-                  {sub2apiMonitorChecking || sub2apiMonitorStatus.running ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}立即检查
-                </button>
-              )}
-              <span className="dialog-actions-spacer" />
-              <button type="button" className="cancel-button" onClick={() => setSub2apiSettingsOpen(false)} disabled={sub2apiSettingsSaving}>取消</button>
-              <button type="submit" className="primary-button" disabled={sub2apiSettingsSaving}>
-                {sub2apiSettingsSaving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}保存配置
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
+
       {batchOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget && !batchBusy) setBatchOpen(false);
@@ -1480,7 +1115,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, cprSyncAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1677,6 +1312,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       <td><StatusBadge status={job.status} /></td>
       <td className="step-cell">
         <div className="prompt-line">{job.prompt}</div>
+        <CprStatus job={job} token={token} />
         {job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}
         {job.autoRepairBlocked && (
           <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
@@ -1784,9 +1420,9 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               <Copy size={16} />复制 Session
             </button>
           )}
-          {job.canDownload && sub2apiUploadAvailable && (
-            <button type="button" className="secondary-button" onClick={onUpload} disabled={submitting} title="上传到已配置的 Sub2API 号池">
-              <Send size={16} />上传
+          {job.canDownload && cprSyncAvailable && (
+            <button type="button" className="secondary-button" onClick={onUpload} disabled={submitting} title="同步到已配置的 Codex Proxy RS">
+              <Send size={16} />同步到 CPR
             </button>
           )}
           {job.canRegenerate && (
@@ -2193,46 +1829,6 @@ function formatMailRequestSummary(settings) {
   } catch {
     return "配置需要检查";
   }
-}
-
-function normalizeSub2ApiSettings(value) {
-  const stored = value && typeof value === "object" ? value : {};
-  const rawGroupIds = Array.isArray(stored.groupIds)
-    ? stored.groupIds
-    : String(stored.groupId || "").trim()
-      ? [stored.groupId]
-      : [];
-  return {
-    baseUrl: String(stored.baseUrl || "http://sub2api:8080"),
-    adminApiKey: String(stored.adminApiKey || ""),
-    groupIds: [...new Set(rawGroupIds.map((id) => String(id).trim()).filter(Boolean))],
-    proxyId: String(stored.proxyId || ""),
-    concurrency: String(stored.concurrency ?? ""),
-    loadFactor: String(stored.loadFactor ?? ""),
-    priority: String(stored.priority ?? ""),
-    modelWhitelist: String(stored.modelWhitelist || ""),
-    codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
-      ? stored.codexFingerprintMode
-      : "session",
-    monitorEnabled: stored.monitorEnabled === true,
-  };
-}
-
-function readSub2ApiSettings(value) {
-  try {
-    const stored = value || JSON.parse(window.localStorage.getItem(SUB2API_UPLOAD_SETTINGS_KEY) || "null");
-    if (stored && typeof stored === "object") return normalizeSub2ApiSettings(stored);
-  } catch {}
-  return normalizeSub2ApiSettings({});
-}
-
-function formatSub2ApiProxy(proxy) {
-  const protocol = String(proxy.protocol || "http").replace(/:\/\/$/, "");
-  const host = String(proxy.host || "");
-  const port = proxy.port ? `:${proxy.port}` : "";
-  const endpoint = host ? `${protocol}://${host}${port}` : "地址未知";
-  const ip = String(proxy.ipAddress || "").trim();
-  return `${proxy.name || `代理 ${proxy.id}`} | ${endpoint}${ip ? ` | 出口 IP：${ip}` : ""}`;
 }
 
 function withSmsProviderDefaults(definitions, settings) {

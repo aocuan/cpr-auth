@@ -1,0 +1,12 @@
+services:
+  cpr-auth:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4399:4399"
+    environment:
+      CPR_AUTH_PASSWORD: ${CPR_AUTH_PASSWORD:?请在 .env 中设置访问密码}
+    volumes:
+      - cpr-auth-data:/var/lib/cpr-auth/data
+volumes:
+  cpr-auth-data:

@@ -12,3 +12,8 @@ chatgpt-protocol-session.json
 sub2api-import*.json
 login-checkpoint.json
 job-meta.json
+
+.venv/
+cpr-key
+cpr-state.enc
+*.enc.*.tmp

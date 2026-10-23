@@ -31,11 +31,11 @@ const sub2api = http.createServer((req, res) => {
     res.writeHead(401).end();
     return;
   }
-  if (req.method === "GET" && req.url?.startsWith("/api/v1/admin/accounts?")) {
+  if (req.method === "GET" && req.url?.startsWith("/api/admin/account-groups/options?")) {
     resolveMonitorRequest();
     return;
   }
-  res.writeHead(404).end();
+  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ code: 200, data: { items: [] } }));
 });
 await new Promise((resolve) => sub2api.listen(sub2apiPort, "127.0.0.1", resolve));
 
@@ -190,16 +190,7 @@ try {
   const created = await createResponse.json();
   await waitForJob(headers, created.job.id, (job) => job.status === "mfa_otp");
 
-  const monitorConfigResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      enabled: true,
-      config: { baseUrl: sub2apiUrl, adminApiKey: "shutdown-test-key" },
-    }),
-  });
-  assert.equal(monitorConfigResponse.status, 200, await monitorConfigResponse.text());
-  void fetch(`${baseUrl}/api/sub2api/monitor/check`, { method: "POST", headers }).catch(() => {});
+  void fetch(`${baseUrl}/api/cpr/options`, { method: "POST", headers, body: JSON.stringify({ config: { baseUrl: sub2apiUrl, adminApiKey: "shutdown-test-key" } }) }).catch(() => {});
   await Promise.race([
     monitorRequestStarted,
     delay(3_000).then(() => { throw new Error("monitor request did not start"); }),
@@ -209,7 +200,7 @@ try {
   const exit = await Promise.race([childExit, delay(10_000).then(() => null)]);
   assert.ok(exit, "console did not exit after SIGTERM");
   assert.equal(exit.code, 0, logs);
-  assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending Sub2API monitor request");
+  assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending CPR connection request");
   const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
   assert.equal(metadata.status, "canceled");
   assert.equal(metadata.prompt, "流程已取消");

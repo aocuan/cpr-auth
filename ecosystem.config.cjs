@@ -7,7 +7,7 @@ const outputRoot = process.env.ONBOARDING_OUTPUT_ROOT
 
 module.exports = {
   apps: [{
-    name: "tosub2",
+    name: "cpr-auth",
     cwd: __dirname,
     script: "src/console-server.mjs",
     args: ["--host", host, "--port", port],

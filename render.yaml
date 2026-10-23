@@ -1,20 +1,22 @@
 services:
   - type: web
-    name: tosub2
+    name: cpr-auth
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: starter
-    healthCheckPath: /
+    healthCheckPath: /healthz
     disk:
-      name: tosub2-data
-      mountPath: /var/lib/tosub2/data
+      name: cpr-auth-data
+      mountPath: /var/lib/cpr-auth/data
       sizeGB: 1
     envVars:
+      - key: CPR_AUTH_PASSWORD
+        generateValue: true
       - key: ONBOARDING_HOST
         value: 0.0.0.0
       - key: ONBOARDING_OUTPUT_ROOT
-        value: /var/lib/tosub2/data
+        value: /var/lib/cpr-auth/data
       - key: TOSUB2_TLS_PROFILE
         value: chrome
       - key: CHATGPT_BASE

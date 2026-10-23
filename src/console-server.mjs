@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 
 import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
+import { createStaticWeb } from "./static-web.mjs";
+import { createCprConnector } from "./cpr-connector.mjs";
 import { createCredentialStore } from "./credential-store.mjs";
 import {
   fetchMailboxOtpCandidates,
@@ -35,9 +37,6 @@ const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
 const CHATGPT_SESSION_FILENAME = "chatgpt-session.json";
 const CHATGPT_SESSION_COOKIES_FILENAME = "chatgpt-session-cookies.json";
-const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
-const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
-const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
 const MAX_MAIL_REQUEST_BODY_BYTES = 64 * 1024;
@@ -64,10 +63,10 @@ const WORKSPACE_ROOT = TOOL_ROOT;
 const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
-const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
+const deletedJobIds = new Set();
 const customSmsPoolPositions = new Map();
 const emailJobLocks = new Map();
 let outputSyncPromise = null;
@@ -75,25 +74,11 @@ let lastOutputSyncAt = 0;
 let shuttingDown = false;
 let queueSchedulingPaused = false;
 let shutdownPromise = null;
-let sub2ApiMonitorConfig = null;
-let sub2ApiMonitorTimer = null;
-let sub2ApiMonitorPromise = null;
 let mailRequestConfig = { method: "GET", url: null, headers: {} };
-const sub2ApiRequestControllers = new Set();
-const sub2ApiRequestPromises = new Set();
-const sub2ApiAutoRepairPromises = new Set();
 const directTlsProfileProbe = new DirectTlsProfileProbe({
   explicitProfile: process.env.TOSUB2_TLS_PROFILE,
   validationUrl: `${String(process.env.CHATGPT_BASE || "https://chatgpt.com").replace(/\/$/, "")}/`,
 });
-const sub2ApiMonitorState = {
-  running: false,
-  lastCheckAt: null,
-  nextCheckAt: null,
-  lastError: null,
-  lastResult: null,
-};
-
 const hostArg = process.argv.find((item) => item.startsWith("--host="));
 const hostIndex = process.argv.indexOf("--host");
 const requestedHost = String(
@@ -117,25 +102,54 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
   throw new Error("--port must be an integer between 1 and 65535");
 }
 
+const accessPassword = process.env.CPR_AUTH_PASSWORD || "";
+if (!["127.0.0.1", "::1", "localhost"].includes(requestedHost) && accessPassword.length < 16) {
+  throw new Error("非本机监听必须设置至少 16 字符的 CPR_AUTH_PASSWORD，并通过 HTTPS 访问");
+}
+
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
-await loadSub2ApiMonitorConfiguration();
+const cpr = await createCprConnector(OUTPUT_ROOT);
+let cprPolling = false;
+const cprTimer = setInterval(async () => {
+  if (cprPolling || shuttingDown) return;
+  cprPolling = true;
+  try { await cpr.poll(); } catch { console.error("[cpr] 状态保存或查询失败"); }
+  finally { cprPolling = false; }
+}, 3000);
+cprTimer.unref();
 await syncCompletedOutputs(true);
 scheduleQueuedJobs();
-scheduleSub2ApiMonitor();
 
-const vite = await createViteServer({
+const vite = process.env.NODE_ENV === "production"
+  ? createStaticWeb(path.join(WEB_ROOT, "dist"))
+  : await createViteServer({
   root: WEB_ROOT,
   configFile: false,
   appType: "spa",
   plugins: [react()],
   server: {
     middlewareMode: true,
-    hmr: { port: hmrPort, clientPort: hmrPort },
+    host: "127.0.0.1",
+    hmr: { host: "127.0.0.1", port: hmrPort, clientPort: hmrPort },
   },
 });
 
+function authorized(req) {
+  if (!accessPassword) return true;
+  const expected = Buffer.from(`Basic ${Buffer.from(`admin:${accessPassword}`).toString("base64")}`);
+  const actual = Buffer.from(req.headers.authorization || "");
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
 const server = http.createServer(async (req, res) => {
   try {
+    if (req.method === "GET" && req.url === "/healthz") {
+      res.writeHead(204); res.end(); return;
+    }
+    if (!authorized(req)) {
+      res.writeHead(401, { "www-authenticate": 'Basic realm="CPR Auth", charset="UTF-8"', "cache-control": "no-store" });
+      res.end("请使用 admin 和部署时配置的访问密码登录");
+      return;
+    }
     enforceUtf8ContentType(res);
     const requestUrl = new URL(req.url || "/", `http://${req.headers.host || `${requestedHost}:${requestedPort}`}`);
     if (requestUrl.pathname.startsWith("/api/")) {
@@ -174,7 +188,7 @@ server.listen(requestedPort, requestedHost, () => {
   for (const url of urls.slice(1)) console.log(`[ok] LAN access: ${url}`);
   console.log(`[info] Output directory: ${OUTPUT_ROOT}`);
   if (isWildcardHost(requestedHost)) {
-    console.log("[note] LAN access is enabled without authentication. Keep downloaded OAuth files private.");
+    console.log("[note] Access password is required. Use HTTPS for remote access.");
   } else {
     console.log("[note] This server only listens on the configured host. Keep downloaded OAuth files private.");
   }
@@ -197,6 +211,7 @@ function getConsoleUrls(host, port) {
 }
 
 async function handleApi(req, res, requestUrl) {
+  if (shuttingDown) { sendJson(res, 503, { error: "服务正在关闭" }); return; }
   if (req.method === "GET" && requestUrl.pathname === "/api/bootstrap") {
     sendJson(res, 200, {
       token: consoleToken,
@@ -212,8 +227,9 @@ async function handleApi(req, res, requestUrl) {
         queue: true,
         sourceExport: true,
         cancelAll: true,
-        sub2apiUpload: true,
-        sub2apiMonitor: true,
+        sub2apiUpload: false,
+        cprSync: true,
+        sub2apiMonitor: false,
         tlsFingerprint: true,
         totpSetup: true,
         passwordAdd: true,
@@ -228,6 +244,33 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (requestUrl.pathname.startsWith("/api/sub2api/")) {
+    sendJson(res, 404, { error: "CPR Auth 仅支持 Codex Proxy RS" });
+    return;
+  }
+  if (requestUrl.pathname === "/api/cpr/config" && req.method === "GET") {
+    sendJson(res, 200, cpr.publicConfig()); return;
+  }
+  if (requestUrl.pathname === "/api/cpr/config" && req.method === "POST") {
+    sendJson(res, 200, await cpr.save(await readJson(req))); return;
+  }
+  if (requestUrl.pathname === "/api/cpr/options" && req.method === "POST") {
+    const body = await readJson(req);
+    sendJson(res, 200, await cpr.options(body.config)); return;
+  }
+  if (requestUrl.pathname === "/api/cpr/sync" && req.method === "POST") {
+    const selected = resolveSelectedJobs((await readJson(req)).ids);
+    const results = [];
+    for (const job of selected) {
+      try { results.push({ id: job.id, ...(await cpr.sync(job)) }); }
+      catch (error) { results.push({ id: job.id, status: "failed", message: error.code ? "授权文件无法读取" : error.message }); }
+    }
+    sendJson(res, 200, { results }); return;
+  }
+  if (requestUrl.pathname === "/api/cpr/reconcile" && req.method === "POST") {
+    const body = await readJson(req);
+    sendJson(res, 200, body.confirmNotImported === true ? await cpr.confirmNotImported(String(body.id)) : await cpr.reconcile(String(body.id), String(body.accountId))); return;
+  }
   if (req.method === "GET" && requestUrl.pathname === "/api/jobs") {
     const requestedPage = Math.max(1, Number.parseInt(requestUrl.searchParams.get("page") || "1", 10) || 1);
     await sendJobsPage(res, requestedPage);
@@ -391,126 +434,6 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/cancel-all") {
     const canceled = await cancelAllJobs();
     sendJson(res, 200, { canceled });
-    return;
-  }
-
-  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/groups") {
-    const body = await readJson(req);
-    const config = normalizeSub2ApiConfig(body.config);
-    const payload = await requestSub2Api(config, "/api/v1/admin/groups/all?platform=openai");
-    const groups = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
-    sendJson(res, 200, {
-      groups: groups
-        .filter((group) => group && Number.isInteger(Number(group.id)))
-        .map((group) => ({
-          id: Number(group.id),
-          name: String(group.name || `号池 ${group.id}`),
-          status: String(group.status || "active"),
-        })),
-    });
-    return;
-  }
-
-  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/options") {
-    const body = await readJson(req);
-    const config = normalizeSub2ApiConfig(body.config);
-    const [groupPayload, proxyPayload] = await Promise.all([
-      requestSub2Api(config, "/api/v1/admin/groups/all?platform=openai"),
-      requestSub2Api(config, "/api/v1/admin/proxies/all"),
-    ]);
-    const groups = Array.isArray(groupPayload) ? groupPayload : Array.isArray(groupPayload?.data) ? groupPayload.data : [];
-    const proxies = Array.isArray(proxyPayload) ? proxyPayload : Array.isArray(proxyPayload?.data) ? proxyPayload.data : [];
-    sendJson(res, 200, {
-      groups: groups
-        .filter((group) => group && Number.isInteger(Number(group.id)))
-        .map((group) => ({ id: Number(group.id), name: String(group.name || `号池 ${group.id}`), status: String(group.status || "active") })),
-      proxies: proxies
-        .filter((proxy) => proxy && Number.isInteger(Number(proxy.id)))
-        .map((proxy) => ({
-          id: Number(proxy.id),
-          name: String(proxy.name || `代理 ${proxy.id}`),
-          protocol: String(proxy.protocol || ""),
-          host: String(proxy.host || ""),
-          port: Number(proxy.port || 0),
-          ipAddress: String(proxy.ip_address || ""),
-          status: String(proxy.status || "active"),
-        })),
-    });
-    return;
-  }
-
-  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/upload") {
-    const body = await readJson(req);
-    const config = normalizeSub2ApiConfig(body.config);
-    const selected = resolveSelectedJobs(body.ids);
-    const downloadable = selected.filter((job) => job.resultSaved);
-    if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
-    const payload = await buildSub2ApiUploadPayload(downloadable);
-    const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
-
-    const accounts = payload.accounts.map((account) => {
-      const { proxy_key: _proxyKey, ...accountData } = account;
-      const credentials = { ...(account.credentials || {}) };
-      const extra = {
-        ...(account.extra && typeof account.extra === "object" ? account.extra : {}),
-        codex_fingerprint_mode: config.codexFingerprintMode,
-      };
-      if (config.modelWhitelist.length) {
-        credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
-      }
-      return {
-        ...accountData,
-        credentials,
-        extra,
-        status: "active",
-        schedulable: true,
-        group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
-        ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
-        ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
-        ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
-        ...(config.priority !== null ? { priority: config.priority } : {}),
-      };
-    });
-    const result = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
-      method: "POST",
-      headers: { "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ accounts }),
-    });
-
-    sendJson(res, 200, {
-      selected: selected.length,
-      uploaded: downloadable.length,
-      skipped: selected.length - downloadable.length,
-      groupIds: config.groupIds,
-      result,
-    });
-    return;
-  }
-
-  if (req.method === "GET" && requestUrl.pathname === "/api/sub2api/monitor") {
-    sendJson(res, 200, publicSub2ApiMonitorState());
-    return;
-  }
-
-  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor") {
-    const body = await readJson(req);
-    if (body.enabled) {
-      const config = normalizeSub2ApiConfig(body.config);
-      sub2ApiMonitorConfig = { ...config, enabled: true };
-    } else {
-      sub2ApiMonitorConfig = null;
-    }
-    sub2ApiMonitorState.lastError = null;
-    await persistSub2ApiMonitorConfiguration();
-    scheduleSub2ApiMonitor();
-    sendJson(res, 200, publicSub2ApiMonitorState());
-    return;
-  }
-
-  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor/check") {
-    if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "请先启用 Sub2API 号池监控");
-    const result = await runSub2ApiMonitor("manual");
-    sendJson(res, 200, { ...publicSub2ApiMonitorState(), result });
     return;
   }
 
@@ -786,9 +709,10 @@ function scheduleQueuedJobs() {
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
     if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
-    if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
+    if (job.deleted || !isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {
+    if (job.deleted || job.queueRunId !== queueRunId) return;
     if (mode === "totp_setup") {
       restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
     } else if (mode === "password_add") {
@@ -813,6 +737,7 @@ function enqueueJob(job, mode, startPrompt) {
 }
 
 function launchJob(job, options = {}) {
+  if (job.deleted) return;
   const mode = options.mode || "full";
   if (mode === "full" && !job.authAutomationAttempt) {
     beginAuthorizationAutomationAttempt(job, "login");
@@ -928,7 +853,6 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (["canceled", "reauth_required"].includes(job.status)) {
-    await finishSub2ApiAutoRepairFailure(job);
     scheduleQueuedJobs();
     return;
   }
@@ -943,7 +867,9 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     job.completedAt = new Date().toISOString();
     touch(job);
     await saveJobMetadata(job);
-    await finishSub2ApiAutoRepairSuccess(job);
+    if (cpr.autoSync()) {
+      void cpr.sync(job).catch(() => appendJobLog(job, "[cpr] 自动同步未完成，请在任务中重试同步\n"));
+    }
     scheduleQueuedJobs();
     return;
   }
@@ -954,7 +880,6 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
       failJob(job, signal ? `登录进程被 ${signal} 终止` : `登录进程退出，代码 ${code ?? "未知"}`);
     }
   }
-  await finishSub2ApiAutoRepairFailure(job);
   scheduleQueuedJobs();
 }
 
@@ -2378,469 +2303,6 @@ async function downloadBatchResult(res, ids) {
   res.end(payload);
 }
 
-async function buildSub2ApiUploadPayload(downloadable) {
-  const accounts = [];
-  const proxies = [];
-  for (const job of downloadable) {
-    if (!(await fileExists(job.outputPath))) throw httpError(409, `${job.email} 的导入文件不存在`);
-    const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
-    if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
-      throw httpError(409, `${job.email} 的导入文件格式不正确`);
-    }
-    accounts.push(...data.accounts);
-    if (Array.isArray(data.proxies)) proxies.push(...data.proxies);
-  }
-  return {
-    type: "sub2api-data",
-    version: 1,
-    exported_at: new Date().toISOString(),
-    proxies: uniqueByJson(proxies),
-    accounts,
-  };
-}
-
-function normalizeSub2ApiConfig(value) {
-  const config = value && typeof value === "object" ? value : {};
-  const baseUrl = String(config.baseUrl || "").trim().replace(/\/+$/, "");
-  const adminApiKey = String(config.adminApiKey || "").trim();
-  if (!baseUrl) throw httpError(400, "请填写 Sub2API 后端地址");
-  let parsed;
-  try {
-    parsed = new URL(baseUrl);
-  } catch {
-    throw httpError(400, "Sub2API 后端地址格式不正确");
-  }
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw httpError(400, "Sub2API 后端地址必须使用 HTTP 或 HTTPS");
-  }
-  if (!adminApiKey || adminApiKey.length > 512 || /[\r\n]/.test(adminApiKey)) {
-    throw httpError(400, "请填写有效的 Sub2API 管理员 API Key");
-  }
-  const rawGroupIds = Array.isArray(config.groupIds)
-    ? config.groupIds
-    : String(config.groupId || "").trim() ? [config.groupId] : [];
-  const groupIds = [...new Set(rawGroupIds.map((value) => String(value).trim()).filter(Boolean))].map((value) => {
-    if (!/^\d+$/.test(value) || Number(value) <= 0 || Number(value) > Number.MAX_SAFE_INTEGER) {
-      throw httpError(400, "目标号池 ID 无效");
-    }
-    return Number(value);
-  });
-  const proxyText = String(config.proxyId || "").trim();
-  if (proxyText && (!/^\d+$/.test(proxyText) || Number(proxyText) <= 0 || Number(proxyText) > Number.MAX_SAFE_INTEGER)) {
-    throw httpError(400, "代理 ID 无效");
-  }
-  const proxyId = proxyText ? Number(proxyText) : 0;
-  const concurrency = parseOptionalSub2ApiInteger(config.concurrency, "并发数", 0, 10000);
-  const loadFactor = parseOptionalSub2ApiInteger(config.loadFactor, "负载因子", 0, 10000);
-  const priority = parseOptionalSub2ApiInteger(config.priority, "优先级", 0, 10000);
-  const modelWhitelist = parseSub2ApiModelWhitelist(config.modelWhitelist);
-  const codexFingerprintMode = String(config.codexFingerprintMode || "session").trim().toLowerCase();
-  if (!["off", "device", "session", "full"].includes(codexFingerprintMode)) {
-    throw httpError(400, "Codex 指纹收敛模式无效");
-  }
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, codexFingerprintMode };
-}
-
-function readDurationEnv(name, fallback, minimum) {
-  const raw = process.env[name];
-  if (raw === undefined || raw === "") return fallback;
-  const value = Number(raw);
-  return Number.isFinite(value) && value >= minimum ? value : fallback;
-}
-
-function parseOptionalSub2ApiInteger(value, label, min, max) {
-  const text = String(value ?? "").trim();
-  if (!text) return null;
-  if (!/^\d+$/.test(text)) throw httpError(400, `${label}必须是数字`);
-  const parsed = Number(text);
-  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) throw httpError(400, `${label}范围必须是 ${min} 到 ${max}`);
-  return parsed;
-}
-
-function parseSub2ApiModelWhitelist(value) {
-  const models = String(value || "")
-    .split(/[\r\n,]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  if (models.length > 200) throw httpError(400, "支持模型最多填写 200 个");
-  if (models.some((model) => model.length > 200 || /[\r\n]/.test(model))) throw httpError(400, "支持模型名称格式不正确");
-  return [...new Set(models)];
-}
-
-function requestSub2Api(config, endpoint, options = {}) {
-  const requestPromise = performSub2ApiRequest(config, endpoint, options);
-  sub2ApiRequestPromises.add(requestPromise);
-  void requestPromise.then(
-    () => sub2ApiRequestPromises.delete(requestPromise),
-    () => sub2ApiRequestPromises.delete(requestPromise),
-  );
-  return requestPromise;
-}
-
-async function performSub2ApiRequest(config, endpoint, options = {}) {
-  const controller = new AbortController();
-  sub2ApiRequestControllers.add(controller);
-  const timeout = setTimeout(() => controller.abort(), 120_000);
-  try {
-    const response = await fetch(`${config.baseUrl}${endpoint}`, {
-      ...options,
-      redirect: "manual",
-      signal: controller.signal,
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json",
-        "x-api-key": config.adminApiKey,
-        ...(options.headers || {}),
-      },
-    });
-    const text = await response.text();
-    let payload = null;
-    try {
-      payload = text ? JSON.parse(text) : null;
-    } catch {
-      payload = null;
-    }
-    if (!response.ok) {
-      const message = sub2ApiResponseMessage(payload, text).slice(0, 500);
-      const error = httpError(502, `Sub2API 返回 HTTP ${response.status}${message ? `：${message}` : ""}`);
-      error.remoteStatus = response.status;
-      throw error;
-    }
-    return payload;
-  } catch (error) {
-    if (error?.status) throw error;
-    if (error?.name === "AbortError") {
-      throw httpError(shuttingDown ? 503 : 504, shuttingDown ? "Sub2API 请求已因服务关闭而取消" : "Sub2API 请求超时");
-    }
-    throw httpError(502, `无法连接 Sub2API 后端：${error.message}`);
-  } finally {
-    clearTimeout(timeout);
-    sub2ApiRequestControllers.delete(controller);
-  }
-}
-
-function sub2ApiResponseMessage(payload, text) {
-  const message = payload?.error?.message || payload?.message || payload?.error || "";
-  return typeof message === "string" && message.trim()
-    ? message.trim()
-    : extractResponseMessage(text);
-}
-
-async function loadSub2ApiMonitorConfiguration() {
-  try {
-    const saved = JSON.parse(await fs.readFile(SUB2API_MONITOR_PATH, "utf8"));
-    const config = normalizeSub2ApiConfig(saved.config);
-    sub2ApiMonitorConfig = { ...config, enabled: saved.enabled === true };
-    sub2ApiMonitorState.lastCheckAt = saved.state?.lastCheckAt || null;
-    sub2ApiMonitorState.lastError = saved.state?.lastError || null;
-    sub2ApiMonitorState.lastResult = saved.state?.lastResult && typeof saved.state.lastResult === "object"
-      ? saved.state.lastResult
-      : null;
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      console.warn(`[warn] Sub2API 号池监控配置无法读取：${String(error?.message || error).slice(0, 180)}`);
-    }
-    sub2ApiMonitorConfig = null;
-  }
-}
-
-async function persistSub2ApiMonitorConfiguration() {
-  if (!sub2ApiMonitorConfig) {
-    await fs.rm(SUB2API_MONITOR_PATH, { force: true });
-    return;
-  }
-  const payload = {
-    version: 1,
-    enabled: Boolean(sub2ApiMonitorConfig.enabled),
-    config: {
-      baseUrl: sub2ApiMonitorConfig.baseUrl,
-      adminApiKey: sub2ApiMonitorConfig.adminApiKey,
-      groupIds: sub2ApiMonitorConfig.groupIds,
-      proxyId: sub2ApiMonitorConfig.proxyId,
-      concurrency: sub2ApiMonitorConfig.concurrency,
-      loadFactor: sub2ApiMonitorConfig.loadFactor,
-      priority: sub2ApiMonitorConfig.priority,
-      modelWhitelist: sub2ApiMonitorConfig.modelWhitelist,
-      codexFingerprintMode: sub2ApiMonitorConfig.codexFingerprintMode,
-    },
-    state: {
-      lastCheckAt: sub2ApiMonitorState.lastCheckAt,
-      lastError: sub2ApiMonitorState.lastError,
-      lastResult: sub2ApiMonitorState.lastResult,
-    },
-    updatedAt: new Date().toISOString(),
-  };
-  const tempPath = `${SUB2API_MONITOR_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(tempPath, SUB2API_MONITOR_PATH);
-}
-
-function publicSub2ApiMonitorState() {
-  return {
-    configured: Boolean(sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey),
-    enabled: Boolean(sub2ApiMonitorConfig?.enabled),
-    baseUrl: sub2ApiMonitorConfig?.baseUrl || null,
-    groupIds: sub2ApiMonitorConfig?.groupIds || [],
-    intervalMinutes: Math.max(1, Math.round(SUB2API_MONITOR_INTERVAL_MS / 60_000)),
-    cooldownMinutes: Math.max(1, Math.round(SUB2API_AUTO_REPAIR_COOLDOWN_MS / 60_000)),
-    running: sub2ApiMonitorState.running,
-    lastCheckAt: sub2ApiMonitorState.lastCheckAt,
-    nextCheckAt: sub2ApiMonitorState.nextCheckAt,
-    lastError: sub2ApiMonitorState.lastError,
-    lastResult: sub2ApiMonitorState.lastResult,
-  };
-}
-
-function scheduleSub2ApiMonitor() {
-  if (sub2ApiMonitorTimer) {
-    clearInterval(sub2ApiMonitorTimer);
-    sub2ApiMonitorTimer = null;
-  }
-  sub2ApiMonitorState.nextCheckAt = null;
-  if (!sub2ApiMonitorConfig?.enabled || shuttingDown) return;
-  const interval = Number.isFinite(SUB2API_MONITOR_INTERVAL_MS) && SUB2API_MONITOR_INTERVAL_MS >= 1_000
-    ? SUB2API_MONITOR_INTERVAL_MS
-    : 5 * 60_000;
-  sub2ApiMonitorState.nextCheckAt = new Date(Date.now() + interval).toISOString();
-  sub2ApiMonitorTimer = setInterval(() => {
-    sub2ApiMonitorState.nextCheckAt = new Date(Date.now() + interval).toISOString();
-    void runSub2ApiMonitor("scheduled").catch((error) => {
-      console.warn(`[warn] Sub2API 号池巡检失败：${String(error?.message || error).slice(0, 180)}`);
-    });
-  }, interval);
-  sub2ApiMonitorTimer.unref?.();
-}
-
-async function runSub2ApiMonitor(trigger = "scheduled") {
-  if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "Sub2API 号池监控未启用");
-  if (sub2ApiMonitorPromise) return sub2ApiMonitorPromise;
-  const config = { ...sub2ApiMonitorConfig, groupIds: [...sub2ApiMonitorConfig.groupIds] };
-  sub2ApiMonitorPromise = (async () => {
-    sub2ApiMonitorState.running = true;
-    sub2ApiMonitorState.lastError = null;
-    const summary = {
-      trigger,
-      checked: 0,
-      matched: 0,
-      started: 0,
-      updated: 0,
-      missingTask: 0,
-      ineligible: 0,
-      blocked: 0,
-      busy: 0,
-      cooldown: 0,
-      outsideGroups: 0,
-      missingEmail: 0,
-    };
-    try {
-      await syncCompletedOutputs(true);
-      await retryPendingSub2ApiUploads(config, summary);
-      if (shuttingDown) throw httpError(503, "服务正在关闭，已停止号池巡检");
-      const remoteAccounts = await listSub2ApiErrorAccounts(config);
-      summary.checked = remoteAccounts.length;
-      const grouped = new Map();
-      for (const account of remoteAccounts) {
-        if (!isSub2ApiAccountInMonitoredGroups(account, config.groupIds)) {
-          summary.outsideGroups += 1;
-          continue;
-        }
-        const email = sub2ApiAccountEmail(account);
-        if (!email) {
-          summary.missingEmail += 1;
-          continue;
-        }
-        if (!grouped.has(email)) grouped.set(email, []);
-        grouped.get(email).push(account);
-      }
-
-      for (const [email, accounts] of grouped) {
-        await withEmailJobLock(email, async () => {
-          const job = findJobByEmail(email);
-          if (!job) {
-            summary.missingTask += accounts.length;
-            return;
-          }
-          summary.matched += accounts.length;
-          if (job.autoRepairBlocked) {
-            summary.blocked += accounts.length;
-            return;
-          }
-          if (isActive(job.status) || job.autoRepairOperation) {
-            summary.busy += accounts.length;
-            return;
-          }
-          if (isAutoRepairCoolingDown(job)) {
-            summary.cooldown += accounts.length;
-            return;
-          }
-          await reloadMissingJobCredentials(job);
-          const eligibility = getAutoRepairEligibility(job);
-          if (!eligibility.eligible) {
-            summary.ineligible += accounts.length;
-            return;
-          }
-
-          const operation = createSub2ApiAutoRepairOperation(config, accounts);
-          await forceReloginJob(job, {}, { autoRepair: operation });
-          appendJobLog(job, `[monitor] Sub2API 号池发现 ${accounts.length} 条异常记录，已自动加入重新登录并授权队列。\n`);
-          await saveJobMetadata(job);
-          summary.started += accounts.length;
-        });
-      }
-
-      sub2ApiMonitorState.lastCheckAt = new Date().toISOString();
-      sub2ApiMonitorState.lastResult = summary;
-      await persistSub2ApiMonitorConfiguration();
-      return summary;
-    } catch (error) {
-      sub2ApiMonitorState.lastCheckAt = new Date().toISOString();
-      sub2ApiMonitorState.lastError = String(error?.message || error).slice(0, 500);
-      await persistSub2ApiMonitorConfiguration().catch(() => {});
-      throw error;
-    } finally {
-      sub2ApiMonitorState.running = false;
-    }
-  })().finally(() => {
-    sub2ApiMonitorPromise = null;
-  });
-  return sub2ApiMonitorPromise;
-}
-
-function createSub2ApiAutoRepairOperation(config, accounts) {
-  const validAccounts = accounts.filter((account) => {
-    const id = Number(account?.id);
-    return Number.isSafeInteger(id) && id > 0;
-  });
-  return {
-    accountIds: validAccounts.map((account) => Number(account.id)),
-    accounts: validAccounts,
-    backend: monitorBackendIdentity(config),
-    config,
-    startedAt: new Date().toISOString(),
-  };
-}
-
-async function retryPendingSub2ApiUploads(config, summary) {
-  const backend = monitorBackendIdentity(config);
-  for (const candidate of listUniqueJobs()) {
-    await withEmailJobLock(candidate.email, async () => {
-      const job = findJobByEmail(candidate.email);
-      const pendingIds = [...new Set(job?.autoRepairPendingAccountIds || [])]
-        .map(Number)
-        .filter((id) => Number.isSafeInteger(id) && id > 0);
-      if (
-        !job
-        || pendingIds.length === 0
-        || job.autoRepairPendingBackend !== backend
-        || !job.resultSaved
-        || job.status !== "completed"
-        || job.autoRepairOperation
-        || isAutoRepairCoolingDown(job)
-      ) return;
-
-      const accounts = [];
-      const missingIds = [];
-      try {
-        for (const accountId of pendingIds) {
-          const account = await getSub2ApiAccount(config, accountId);
-          if (account) accounts.push(account);
-          else missingIds.push(accountId);
-        }
-      } catch (error) {
-        job.autoRepairLastAttemptAt = new Date().toISOString();
-        job.autoRepairLastError = String(error?.message || error).slice(0, 500);
-        appendJobLog(job, `[monitor] 读取待重传的 Sub2API 账号失败：${job.autoRepairLastError}。\n`);
-        touch(job);
-        await saveJobMetadata(job);
-        return;
-      }
-
-      if (missingIds.length) {
-        const missing = new Set(missingIds);
-        job.autoRepairPendingAccountIds = pendingIds.filter((id) => !missing.has(id));
-        appendJobLog(job, `[monitor] ${missingIds.length} 条待重传账号已从 Sub2API 删除，已停止重试。\n`);
-      }
-      if (!accounts.length) {
-        job.autoRepairPendingBackend = null;
-        job.autoRepairLastError = null;
-        touch(job);
-        await saveJobMetadata(job);
-        return;
-      }
-
-      job.autoRepairOperation = createSub2ApiAutoRepairOperation(config, accounts);
-      job.autoRepairLastAttemptAt = new Date().toISOString();
-      appendJobLog(job, `[monitor] 正在重传 ${accounts.length} 条上次未完成的 Sub2API 更新，不重复登录。\n`);
-      if (await finishSub2ApiAutoRepairSuccess(job)) summary.updated += accounts.length;
-    });
-  }
-}
-
-async function getSub2ApiAccount(config, accountId) {
-  try {
-    const payload = await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}`);
-    const account = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-    if (!account || Number(account.id) !== Number(accountId)) {
-      throw new Error(`Sub2API 账号 ${accountId} 返回数据不完整`);
-    }
-    return account;
-  } catch (error) {
-    if (error?.remoteStatus === 404) return null;
-    throw error;
-  }
-}
-
-async function listSub2ApiErrorAccounts(config) {
-  const accounts = [];
-  let page = 1;
-  let pages = 1;
-  do {
-    const query = new URLSearchParams({
-      page: String(page),
-      page_size: "100",
-      platform: "openai",
-      status: "error",
-    });
-    const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
-    const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-    const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
-    accounts.push(...items.filter((account) => account && String(account.platform || "openai") === "openai" && String(account.status || "error") === "error"));
-    const reportedPages = Number(data?.pages);
-    pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
-      ? reportedPages
-      : items.length >= 100 ? page + 1 : page;
-    page += 1;
-  } while (page <= pages && page <= 1_000);
-  return accounts;
-}
-
-function sub2ApiAccountEmail(account) {
-  const direct = [account?.credentials?.email, account?.extra?.email]
-    .map((value) => String(value || "").trim().toLowerCase())
-    .find(isEmail);
-  if (direct) return direct;
-  const match = String(account?.name || "").toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
-  return match && isEmail(match[0]) ? match[0] : null;
-}
-
-function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
-  if (!groupIds.length) return true;
-  const accountGroupIds = [
-    ...(Array.isArray(account?.group_ids) ? account.group_ids : []),
-    ...(Array.isArray(account?.account_groups) ? account.account_groups.map((item) => item?.group_id) : []),
-  ].map(Number).filter(Number.isSafeInteger);
-  return groupIds.some((id) => accountGroupIds.includes(Number(id)));
-}
-
-function monitorBackendIdentity(config) {
-  return crypto.createHash("sha256").update(String(config?.baseUrl || "")).digest("hex").slice(0, 24);
-}
-
-function isAutoRepairCoolingDown(job) {
-  if (!job.autoRepairLastAttemptAt || !Number.isFinite(SUB2API_AUTO_REPAIR_COOLDOWN_MS) || SUB2API_AUTO_REPAIR_COOLDOWN_MS <= 0) return false;
-  return Date.now() - new Date(job.autoRepairLastAttemptAt).getTime() < SUB2API_AUTO_REPAIR_COOLDOWN_MS;
-}
-
 function getAutoRepairEligibility(job) {
   if (job.autoRepairBlocked) return { eligible: false, reason: "账号已确认封禁、删除或永久停用" };
   if (!job.lastAuthAutomated) return { eligible: false, reason: job.lastAuthAutomationReason || "上次授权不是全自动完成" };
@@ -2851,93 +2313,6 @@ function getAutoRepairEligibility(job) {
   if (!job.password && !job.mailApiUrl) return { eligible: false, reason: "缺少可自动登录的密码或邮件收码 API" };
   if (job.hasTotpCredential && !job.totpSecret) return { eligible: false, reason: "2FA 密钥在当前系统上无法恢复" };
   return { eligible: true, reason: "上次完整登录全自动完成，所需资料仍可用" };
-}
-
-function finishSub2ApiAutoRepairSuccess(job) {
-  const operationPromise = performSub2ApiAutoRepairSuccess(job);
-  sub2ApiAutoRepairPromises.add(operationPromise);
-  void operationPromise.then(
-    () => sub2ApiAutoRepairPromises.delete(operationPromise),
-    () => sub2ApiAutoRepairPromises.delete(operationPromise),
-  );
-  return operationPromise;
-}
-
-async function performSub2ApiAutoRepairSuccess(job) {
-  const operation = job.autoRepairOperation;
-  if (!operation) return false;
-  job.autoRepairPendingAccountIds = [...new Set(operation.accountIds)];
-  job.autoRepairPendingBackend = operation.backend;
-  try {
-    const payload = await buildSub2ApiUploadPayload([job]);
-    const localAccount = payload.accounts.find((account) => sub2ApiAccountEmail(account) === job.email.toLowerCase())
-      || payload.accounts[0];
-    if (!localAccount?.credentials) throw new Error("新授权文件中没有可更新的账号凭据");
-
-    const pendingIds = new Set(job.autoRepairPendingAccountIds);
-    for (const remoteAccount of operation.accounts) {
-      const accountId = Number(remoteAccount.id);
-      if (!Number.isSafeInteger(accountId) || accountId <= 0) continue;
-      const credentials = {
-        ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
-        ...localAccount.credentials,
-      };
-      const extra = {
-        ...(remoteAccount.extra && typeof remoteAccount.extra === "object" ? remoteAccount.extra : {}),
-        codex_fingerprint_mode: operation.config.codexFingerprintMode,
-      };
-      await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}`, {
-        method: "PUT",
-        body: JSON.stringify({ credentials, extra }),
-      });
-      await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
-        method: "POST",
-        body: "{}",
-      });
-      await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
-        method: "POST",
-        body: JSON.stringify({ schedulable: true }),
-      });
-      pendingIds.delete(accountId);
-      job.autoRepairPendingAccountIds = [...pendingIds];
-    }
-
-    job.autoRepairLastSuccessAt = new Date().toISOString();
-    job.autoRepairLastError = null;
-    job.autoRepairPendingAccountIds = [];
-    job.autoRepairPendingBackend = null;
-    job.autoRepairOperation = null;
-    clearAutoRepairBlock(job);
-    appendJobLog(job, `[monitor] 已用新授权覆盖更新 Sub2API 中的 ${operation.accountIds.length} 条账号记录。\n`);
-    touch(job);
-    await saveJobMetadata(job);
-    return true;
-  } catch (error) {
-    job.autoRepairLastAttemptAt = new Date().toISOString();
-    job.autoRepairLastError = String(error?.message || error).slice(0, 500);
-    job.autoRepairOperation = null;
-    appendJobLog(job, `[monitor] 新授权已生成，但更新 Sub2API 失败：${job.autoRepairLastError}。下次巡检会优先重传，不会重复登录。\n`);
-    touch(job);
-    await saveJobMetadata(job);
-    return false;
-  }
-}
-
-async function finishSub2ApiAutoRepairFailure(job) {
-  if (!job.autoRepairOperation) return;
-  const operation = job.autoRepairOperation;
-  job.autoRepairOperation = null;
-  job.autoRepairLastAttemptAt = new Date().toISOString();
-  job.autoRepairLastError = job.autoRepairBlockedReason || job.lastError || "自动重新登录并授权未完成";
-  appendJobLog(job, job.autoRepairBlocked
-    ? "[monitor] 自动授权确认账号已永久不可用，已停止后续巡检。\n"
-    : `[monitor] 本次自动授权未完成，${Math.max(1, Math.round(SUB2API_AUTO_REPAIR_COOLDOWN_MS / 60_000))} 分钟内不会重复启动。\n`);
-  if (!job.autoRepairBlocked) {
-    job.autoRepairPendingAccountIds = [];
-    job.autoRepairPendingBackend = operation.backend;
-  }
-  touch(job);
-  await saveJobMetadata(job);
 }
 
 async function exportSourceAccounts(res, ids) {
@@ -3008,6 +2383,7 @@ function publicJob(job) {
     lastOperationType: job.lastOperationType || "initial_authorization",
     completedAt: job.completedAt,
     lastError: job.lastError,
+    cprSync: cpr.view(job.id),
     canDownload: Boolean(job.resultSaved),
     canCopySession: Boolean(job.sessionPath && job.sessionUpdatedAt),
     sessionUpdatedAt: job.sessionUpdatedAt || null,
@@ -3266,17 +2642,21 @@ function resolveSelectedJobs(ids) {
 async function deleteJobsByEmail(email) {
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
   const directories = new Set();
+  const childWaits = [];
   matching.forEach((job) => {
     job.deleted = true;
+    deletedJobIds.add(job.id);
+    job.queueRunId = null;
     stopMailPolling(job);
     releaseSmsNumber(job, "idle");
     job.runId = crypto.randomUUID();
+    if (job.child) childWaits.push(waitForChildExit(job.child, 3000));
     job.child?.kill("SIGTERM");
     job.child = null;
     directories.add(path.dirname(job.outputPath));
     jobs.delete(job.id);
   });
-  await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
+  await Promise.allSettled([...childWaits, ...matching.map((job) => job.metadataWritePromise).filter(Boolean)]);
   await Promise.all([
     ...[...directories].map((directory) => fs.rm(directory, { recursive: true, force: true })),
     deleteStoredLoginCredentials(email),
@@ -3287,6 +2667,11 @@ async function deleteJobsByEmail(email) {
 function downloadTimestamp(date = new Date()) {
   const pad = (value) => String(value).padStart(2, "0");
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function setRestoredJob(id, job) {
+  // 扫描中的异步读取可能晚于删除完成，恢复前再次检查删除标记
+  if (!deletedJobIds.has(id)) jobs.set(id, job);
 }
 
 async function syncCompletedOutputs(force = false) {
@@ -3301,7 +2686,7 @@ async function syncCompletedOutputs(force = false) {
       return;
     }
     await Promise.all(entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
-      if (jobs.has(entry.name)) return;
+      if (jobs.has(entry.name) || deletedJobIds.has(entry.name)) return;
       const outputDir = path.join(OUTPUT_ROOT, entry.name);
       const outputPath = path.join(outputDir, "sub2api-import-oauth.json");
       const checkpointPath = path.join(outputDir, LOGIN_CHECKPOINT_FILENAME);
@@ -3337,7 +2722,7 @@ async function syncCompletedOutputs(force = false) {
         });
         storedCredentials = totpRecovery.credentials;
         const restoredOperation = restoredOutputOperationState(metadata, completedAt, totpRecovery, passwordRecovery);
-        jobs.set(entry.name, {
+        setRestoredJob(entry.name, {
           id: entry.name,
           email,
           status: restoredOperation.status,
@@ -3419,7 +2804,7 @@ async function syncCompletedOutputs(force = false) {
         const restoredStatus = passwordRecovery.recovered || totpRecovery.recovered
           ? "resume_available"
           : isTerminalStatus(savedStatus) ? savedStatus : "resume_available";
-        jobs.set(entry.name, {
+        setRestoredJob(entry.name, {
           id: entry.name,
           email,
           status: restoredStatus,
@@ -3520,7 +2905,7 @@ async function syncCompletedOutputs(force = false) {
           : interrupted || !savedStatus
             ? metadata.last_error || `上次 ${savedStatus || "未知"} 阶段未完成`
             : metadata.last_error || null;
-        jobs.set(entry.name, {
+        setRestoredJob(entry.name, {
           id: entry.name,
           email: metadata.email,
           status: restoredStatus,
@@ -4660,17 +4045,9 @@ async function shutdown() {
   if (shutdownPromise) return shutdownPromise;
   shutdownPromise = (async () => {
     shuttingDown = true;
+    clearInterval(cprTimer);
+    await cpr.close();
     queueSchedulingPaused = true;
-    if (sub2ApiMonitorTimer) {
-      clearInterval(sub2ApiMonitorTimer);
-      sub2ApiMonitorTimer = null;
-    }
-    for (const controller of sub2ApiRequestControllers) controller.abort();
-    await Promise.allSettled([
-      sub2ApiMonitorPromise,
-      ...sub2ApiRequestPromises,
-      ...sub2ApiAutoRepairPromises,
-    ].filter(Boolean));
     const activeJobs = [...jobs.values()].filter((job) => isActive(job.status));
     const childWaits = activeJobs
       .map((job) => job.child)

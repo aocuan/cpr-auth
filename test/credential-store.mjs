@@ -9,6 +9,7 @@ const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-credentials-"))
 
 try {
   const powerShellRunner = async (script, input) => {
+    assert.ok(script.includes('cpr-auth.credentials.v1'), "使用独立应用的 DPAPI 用途标识");
     if (script.includes("ProtectedData]::Protect")) {
       return { code: 0, stdout: Buffer.from(input, "utf8").toString("base64"), stderr: "" };
     }
@@ -59,6 +60,7 @@ try {
     platform: "darwin",
     macRoot: path.join(tempRoot, "mac"),
     securityRunner: async (args, input = "") => {
+      assert.equal(args[args.indexOf("-s") + 1], "com.local.cpr-auth.credentials", "不得访问原 toSub2 的钥匙串条目");
       if (args[0] === "add-generic-password") {
         assert.equal(args.at(-1), "-w");
         assert.equal(args.some((value) => value.includes(credentials.password)), false);
@@ -104,6 +106,30 @@ try {
     unsupportedStore.save(email, credentials),
     (error) => error.status === 501 && error.message.includes("Windows DPAPI"),
   );
+
+  // 模拟批量恢复凭据：子进程资源受限，单次失败不能阻塞后续队列
+  let active = 0;
+  let peak = 0;
+  let calls = 0;
+  const boundedStore = createCredentialStore({
+    platform: "win32",
+    windowsRoot: path.join(tempRoot, "bounded"),
+    powerShellRunner: async (_script, input) => {
+      const call = calls++;
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setImmediate(resolve));
+      active--;
+      if (call === 0) throw new Error("simulated process failure");
+      return { code: 0, stdout: Buffer.from(input).toString("base64"), stderr: "" };
+    },
+  });
+  const results = await Promise.allSettled(Array.from({ length: 32 }, (_, index) =>
+    boundedStore.save(`batch-${index}@example.com`, credentials)));
+  assert.equal(results.filter(result => result.status === "rejected").length, 1);
+  assert.equal(calls, 32, "失败后仍应处理所有等待任务");
+  assert.ok(peak <= 8, `凭据子进程并发失控：${peak}`);
+  assert.equal(active, 0);
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
 }

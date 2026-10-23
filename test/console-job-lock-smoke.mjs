@@ -14,6 +14,7 @@ const mailboxPort = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
 const mailboxUrl = `http://127.0.0.1:${mailboxPort}/messages`;
 let latestMailboxRequest = null;
+let releaseMailbox = null;
 const mailbox = http.createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -22,6 +23,9 @@ const mailbox = http.createServer(async (req, res) => {
     authorization: req.headers.authorization,
     body: Buffer.concat(chunks).toString("utf8"),
   };
+  if (latestMailboxRequest.body.includes("delete-before-launch")) {
+    await new Promise(resolve => { releaseMailbox = resolve; });
+  }
   res.writeHead(200, { "content-type": "application/json" });
   res.end("[]");
 });
@@ -41,6 +45,7 @@ const child = spawn(process.execPath, [
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-queue-protocol.mjs"),
     TOSUB2_TLS_PROFILE: "chrome142",
+    MOCK_QUEUE_LAUNCH_LOG: path.join(outputRoot, "launches.log"),
   },
   stdio: ["ignore", "pipe", "pipe"],
   windowsHide: true,
@@ -126,11 +131,49 @@ try {
   const logsAfterConcurrentRelogin = await (await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers })).json();
   assert.equal(countOccurrences(logsAfterConcurrentRelogin.logs, "Mock queued login started"), 3);
   await fetch(`${baseUrl}/api/jobs/${jobId}/cancel`, { method: "POST", headers, body: "{}" });
+
+  const delayedResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST", headers,
+    body: JSON.stringify({ email: "deleted-before-launch@example.com", mailRequestBody: '{"mailbox_id":"delete-before-launch"}' }),
+  });
+  assert.equal(delayedResponse.status, 201);
+  const delayedJob = (await delayedResponse.json()).job;
+  await waitFor(() => releaseMailbox !== null);
+  const removeDelayed = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
+    method: "POST", headers, body: JSON.stringify({ ids: [delayedJob.id] }),
+  });
+  assert.equal(removeDelayed.status, 200, await removeDelayed.text());
+  releaseMailbox();
+  releaseMailbox = null;
+  await delay(800);
+  const launches = await fs.readFile(path.join(outputRoot, "launches.log"), "utf8");
+  assert.equal(launches.includes("deleted-before-launch@example.com"), false, "删除后完成的邮件预检查不得启动授权子进程");
+
+  // 模拟删除完成后迟到的产物，输出扫描不得再次恢复被删除的任务
+  const lateId = "11111111-1111-4111-8111-111111111111";
+  const lateDirectory = path.join(outputRoot, lateId);
+  async function writeLateOutput() {
+    await fs.mkdir(lateDirectory, { recursive: true });
+    await fs.writeFile(path.join(lateDirectory, "sub2api-import-oauth.json"), JSON.stringify({
+      type: "sub2api-data", accounts: [{ name: "late-output@example.com", credentials: { email: "late-output@example.com", access_token: "fixture" } }],
+    }));
+  }
+  await writeLateOutput();
+  await waitForJob(headers, lateId, job => job.status === "completed");
+  const removeLate = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
+    method: "POST", headers, body: JSON.stringify({ ids: [lateId] }),
+  });
+  assert.equal(removeLate.status, 200, await removeLate.text());
+  await writeLateOutput();
+  await delay(2100);
+  const afterLate = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
+  assert.equal(afterLate.jobs.some(job => job.id === lateId), false, "迟到的产物不得复活已删除任务");
   console.log("console job lock tests passed");
 } catch (error) {
   error.message = `${error.message}\nConsole output:\n${consoleLogs}`;
   throw error;
 } finally {
+  releaseMailbox?.();
   if (child.exitCode === null) child.kill("SIGKILL");
   await Promise.race([childExit, delay(2_000)]);
   await new Promise((resolve) => mailbox.close(resolve));

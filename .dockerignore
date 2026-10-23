@@ -7,3 +7,9 @@ docs
 test
 __pycache__
 *.pyc
+
+.env
+.env.*
+cpr-key
+cpr-state.enc
+web/dist

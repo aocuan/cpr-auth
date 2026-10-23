@@ -11,114 +11,23 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-console-"));
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
-const sub2apiPort = await findAvailablePort();
-const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
-let uploadedAccounts = [];
-let remoteErrorAccounts = [];
-const updatedRemoteAccounts = new Map();
-const clearedRemoteAccountIds = new Set();
-const scheduledRemoteAccounts = new Map();
-const clearRemoteCounts = new Map();
-const failClearOnce = new Set();
-const sub2api = http.createServer(async (req, res) => {
-  if (req.headers["x-api-key"] !== "test-admin-key") {
-    res.writeHead(401, { "content-type": "application/json" });
-    res.end(JSON.stringify({ message: "invalid admin key" }));
-    return;
+const cprPort = await findAvailablePort();
+const cprUrl = `http://127.0.0.1:${cprPort}`;
+let importedItems = [];
+const cpr = http.createServer(async (req, res) => {
+  const reply = (data, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify({ code: 200, data })); };
+  if (req.headers["x-api-key"] !== "test-admin-key") return reply(null, 401);
+  if (req.url.startsWith("/api/admin/account-groups/options")) return reply({ items: [{ id: "grp_test", name: "测试组", enabled: true }] });
+  if (req.url.startsWith("/api/admin/proxies")) return reply({ items: [] });
+  if (req.method === "POST" && req.url === "/api/admin/accounts/import-tasks") {
+    let raw = ""; for await (const chunk of req) raw += chunk;
+    importedItems.push(...JSON.parse(raw).items);
+    return reply({ taskId: `task_${importedItems.length}` }, 202);
   }
-  if (req.method === "GET" && req.url === "/api/v1/admin/groups/all?platform=openai") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify([
-      { id: 7, name: "测试号池", status: "active" },
-      { id: 8, name: "备用号池", status: "active" },
-    ]));
-    return;
-  }
-  if (req.method === "GET" && req.url === "/api/v1/admin/proxies/all") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify([{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ip_address: "203.0.113.10", status: "active" }]));
-    return;
-  }
-  if (req.method === "POST" && req.url === "/api/v1/admin/accounts/batch") {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    uploadedAccounts = body.accounts || [];
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0, results: [] }));
-    return;
-  }
-  if (req.method === "GET" && req.url?.startsWith("/api/v1/admin/accounts?")) {
-    const requestUrl = new URL(req.url, sub2apiUrl);
-    const status = requestUrl.searchParams.get("status");
-    const items = remoteErrorAccounts.filter((account) => !status || account.status === status);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({
-      code: 0,
-      message: "success",
-      data: { items, total: items.length, page: 1, page_size: 100, pages: 1 },
-    }));
-    return;
-  }
-  const detailMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url || "");
-  if (req.method === "GET" && detailMatch) {
-    const accountId = Number(detailMatch[1]);
-    const account = remoteErrorAccounts.find((item) => Number(item.id) === accountId);
-    if (!account) {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ message: "account not found" }));
-      return;
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ code: 0, message: "success", data: account }));
-    return;
-  }
-  const updateMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url || "");
-  if (req.method === "PUT" && updateMatch) {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const accountId = Number(updateMatch[1]);
-    updatedRemoteAccounts.set(accountId, body);
-    remoteErrorAccounts = remoteErrorAccounts.map((account) => (
-      Number(account.id) === accountId ? { ...account, ...body } : account
-    ));
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ code: 0, message: "success", data: { id: accountId } }));
-    return;
-  }
-  const clearMatch = /^\/api\/v1\/admin\/accounts\/(\d+)\/clear-error$/.exec(req.url || "");
-  if (req.method === "POST" && clearMatch) {
-    const accountId = Number(clearMatch[1]);
-    clearedRemoteAccountIds.add(accountId);
-    clearRemoteCounts.set(accountId, (clearRemoteCounts.get(accountId) || 0) + 1);
-    remoteErrorAccounts = remoteErrorAccounts.map((account) => (
-      Number(account.id) === accountId ? { ...account, status: "active", error_message: "" } : account
-    ));
-    if (failClearOnce.delete(accountId)) {
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ message: "rate-limit cleanup failed after status recovery" }));
-      return;
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ code: 0, message: "success", data: { id: accountId, status: "active" } }));
-    return;
-  }
-  const schedulableMatch = /^\/api\/v1\/admin\/accounts\/(\d+)\/schedulable$/.exec(req.url || "");
-  if (req.method === "POST" && schedulableMatch) {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const accountId = Number(schedulableMatch[1]);
-    scheduledRemoteAccounts.set(accountId, body.schedulable);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ code: 0, message: "success", data: { id: accountId, schedulable: body.schedulable } }));
-    return;
-  }
-  res.writeHead(404, { "content-type": "application/json" });
-  res.end(JSON.stringify({ message: "not found" }));
+  if (req.url.startsWith("/api/admin/accounts/import-tasks/detail")) return reply({ total: 1, finishedAt: new Date().toISOString(), items: [{ status: "succeeded", accountIds: ["acct_test"] }] });
+  reply(null, 404);
 });
-await new Promise((resolve) => sub2api.listen(sub2apiPort, "127.0.0.1", resolve));
+await new Promise(resolve => cpr.listen(cprPort, "127.0.0.1", resolve));
 const child = spawn(process.execPath, [
   path.join(projectRoot, "src", "console-server.mjs"),
   "--host",
@@ -608,85 +517,22 @@ try {
   assert.equal(continuedTotpPhoneOtpResponse.status, 200, await continuedTotpPhoneOtpResponse.text());
   await waitForJob(headers, incompleteTotpId, (value) => value.status === "completed");
 
-  const groupsResponse = await fetch(`${baseUrl}/api/sub2api/options`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key" } }),
+  const cprConfigResponse = await fetch(`${baseUrl}/api/cpr/config`, {
+    method: "POST", headers, body: JSON.stringify({ baseUrl: cprUrl, adminApiKey: "test-admin-key", groupIds: ["grp_test"], autoSync: true }),
   });
-  assert.equal(groupsResponse.status, 200);
-  assert.deepEqual(await groupsResponse.json(), {
-    groups: [
-      { id: 7, name: "测试号池", status: "active" },
-      { id: 8, name: "备用号池", status: "active" },
-    ],
-    proxies: [{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ipAddress: "203.0.113.10", status: "active" }],
-  });
-
-  const uploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      ids: [profileJob.id, "missing-job-is-filtered-by-selection-limit"],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full" },
-    }),
-  });
-  assert.equal(uploadResponse.status, 404);
-
-  const validUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      ids: [profileJob.id],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full" },
-    }),
-  });
-  const validUploadText = await validUploadResponse.text();
-  assert.equal(validUploadResponse.status, 200, validUploadText);
-  const uploadResult = JSON.parse(validUploadText);
-  assert.equal(uploadResult.uploaded, 1);
-  assert.equal(uploadResult.result.success, 1);
-  assert.deepEqual(uploadedAccounts[0].group_ids, [7, 8]);
-  assert.equal(uploadedAccounts[0].proxy_id, 3);
-  assert.equal(uploadedAccounts[0].concurrency, 10);
-  assert.equal(uploadedAccounts[0].load_factor, 100);
-  assert.equal(uploadedAccounts[0].priority, 1);
-  assert.equal(uploadedAccounts[0].status, "active");
-  assert.equal(uploadedAccounts[0].schedulable, true);
-  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "full");
-  assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
-  assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
-
-  const legacyUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      ids: [profileJob.id],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key" },
-    }),
-  });
-  assert.equal(legacyUploadResponse.status, 200, await legacyUploadResponse.text());
-  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "session", "旧配置未填写时应使用 Sub2API 的推荐默认值");
-
-  const disabledFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      ids: [profileJob.id],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", codexFingerprintMode: "off" },
-    }),
-  });
-  assert.equal(disabledFingerprintUploadResponse.status, 200, await disabledFingerprintUploadResponse.text());
-  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off", "关闭模式必须显式写入，不能退回默认值");
-
-  const invalidFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      ids: [profileJob.id],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", codexFingerprintMode: "invalid" },
-    }),
-  });
-  assert.equal(invalidFingerprintUploadResponse.status, 400, await invalidFingerprintUploadResponse.text());
+  assert.equal(cprConfigResponse.status, 200, await cprConfigResponse.text());
+  const safeConfig = await (await fetch(`${baseUrl}/api/cpr/config`, { headers })).json();
+  assert.equal(safeConfig.hasAdminApiKey, true);
+  assert.equal(safeConfig.adminApiKey, undefined);
+  const syncResponse = await fetch(`${baseUrl}/api/cpr/sync`, { method: "POST", headers, body: JSON.stringify({ ids: [profileJob.id] }) });
+  assert.equal(syncResponse.status, 200);
+  const syncResult = await syncResponse.json();
+  assert.equal(syncResult.results[0].status, "succeeded");
+  assert.equal(importedItems[0].provider, "openai");
+  assert.ok(importedItems[0].data.accessToken);
+  const syncCount = importedItems.length;
+  await fetch(`${baseUrl}/api/cpr/sync`, { method: "POST", headers, body: JSON.stringify({ ids: [profileJob.id] }) });
+  assert.equal(importedItems.length, syncCount);
 
   const mailApiUrl = `${baseUrl}/api/bootstrap`;
   const sourceLines = [
@@ -827,119 +673,8 @@ try {
   );
   assert.equal(manualPhoneCompleted.autoRepairEligible, true);
 
-  const monitorJob = await waitForJob(
-    headers,
-    batch.jobs.find((item) => item.email === "password-mail@example.com").id,
-    (value) => value.status === "completed" && value.autoRepairEligible,
-  );
-  const monitorConfig = {
-    baseUrl: sub2apiUrl,
-    adminApiKey: "test-admin-key",
-    groupIds: ["7"],
-    codexFingerprintMode: "device",
-  };
-  const monitorSaveResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ enabled: true, config: monitorConfig }),
-  });
-  const monitorSaveText = await monitorSaveResponse.text();
-  assert.equal(monitorSaveResponse.status, 200, monitorSaveText);
-  const monitorSaved = JSON.parse(monitorSaveText);
-  assert.equal(monitorSaved.enabled, true);
-  assert.equal(monitorSaved.configured, true);
-
-  remoteErrorAccounts = [{
-    id: 91,
-    name: "oauth---password-mail@example.com",
-    platform: "openai",
-    type: "oauth",
-    status: "error",
-    error_message: "refresh token expired",
-    credentials: { email: "password-mail@example.com", model_mapping: { "gpt-5": "gpt-5" } },
-    extra: { existing_setting: "preserved", codex_fingerprint_mode: "off" },
-    group_ids: [7],
-  }];
-  failClearOnce.add(91);
-  const monitorCheckResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
-    method: "POST",
-    headers,
-  });
-  const monitorCheckText = await monitorCheckResponse.text();
-  assert.equal(monitorCheckResponse.status, 200, monitorCheckText);
-  const monitorCheck = JSON.parse(monitorCheckText);
-  assert.equal(monitorCheck.result.checked, 1);
-  assert.equal(monitorCheck.result.started, 1);
-  const firstRepair = await waitForJob(
-    headers,
-    monitorJob.id,
-    (value) => value.status === "completed" && value.attempt > monitorJob.attempt && value.autoRepairLastError,
-  );
-  assert.equal(Object.hasOwn(updatedRemoteAccounts.get(91), "status"), false);
-  assert.equal(remoteErrorAccounts[0].status, "active", "the mock simulates clear-error partially restoring status before failing");
-  assert.equal(scheduledRemoteAccounts.has(91), false, "scheduling must remain disabled until error cleanup succeeds");
-
-  const pendingRetryResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
-    method: "POST",
-    headers,
-  });
-  const pendingRetryText = await pendingRetryResponse.text();
-  assert.equal(pendingRetryResponse.status, 200, pendingRetryText);
-  const pendingRetry = JSON.parse(pendingRetryText);
-  assert.equal(pendingRetry.result.checked, 0, "an active account no longer appears in the error-only list");
-  assert.equal(pendingRetry.result.updated, 1, "persisted pending IDs must still be retried directly");
-  const repairedJob = await waitForJob(headers, monitorJob.id, (value) => value.autoRepairLastSuccessAt && !value.autoRepairLastError);
-  assert.equal(repairedJob.attempt, firstRepair.attempt, "retrying the remote update must not repeat account login");
-  assert.equal(clearRemoteCounts.get(91), 2);
-  assert.equal(scheduledRemoteAccounts.get(91), true);
-  assert.match(updatedRemoteAccounts.get(91).credentials.access_token, /^test-access-password-mail@example\.com$/);
-  assert.deepEqual(updatedRemoteAccounts.get(91).credentials.model_mapping, { "gpt-5": "gpt-5" });
-  assert.deepEqual(updatedRemoteAccounts.get(91).extra, {
-    existing_setting: "preserved",
-    codex_fingerprint_mode: "device",
-  });
-
-  const bannedCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ email: "monitor-banned@example.com", password: "saved-test-password" }),
-  });
-  const bannedCreateText = await bannedCreateResponse.text();
-  assert.equal(bannedCreateResponse.status, 201, bannedCreateText);
-  const bannedJobId = JSON.parse(bannedCreateText).job.id;
-  await waitForJob(headers, bannedJobId, (value) => value.status === "completed" && value.autoRepairEligible);
-  remoteErrorAccounts = [{
-    id: 92,
-    name: "oauth---monitor-banned@example.com",
-    platform: "openai",
-    type: "oauth",
-    status: "error",
-    error_message: "token invalid",
-    credentials: { email: "monitor-banned@example.com" },
-    group_ids: [7],
-  }];
-  const bannedMonitorResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
-    method: "POST",
-    headers,
-  });
-  const bannedMonitorText = await bannedMonitorResponse.text();
-  assert.equal(bannedMonitorResponse.status, 200, bannedMonitorText);
-  assert.equal(JSON.parse(bannedMonitorText).result.started, 1);
-  const blockedJob = await waitForJob(
-    headers,
-    bannedJobId,
-    (value) => value.status === "failed" && value.autoRepairBlocked,
-  );
-  assert.match(blockedJob.autoRepairBlockedReason, /deactivated/i);
-  const blockedCheckResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
-    method: "POST",
-    headers,
-  });
-  const blockedCheckText = await blockedCheckResponse.text();
-  assert.equal(blockedCheckResponse.status, 200, blockedCheckText);
-  const blockedCheck = JSON.parse(blockedCheckText);
-  assert.equal(blockedCheck.result.started, 0);
-  assert.equal(blockedCheck.result.blocked, 1);
+  const autoSynced = await waitForJob(headers, batch.jobs.find(item => item.email === "password-mail@example.com").id, value => value.cprSync?.status === "succeeded");
+  assert.deepEqual(autoSynced.cprSync.accountIds, ["acct_test"]);
 
   const directRiskResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -1038,7 +773,6 @@ try {
       proxyConnectionCreated.job.id,
       proxyConnectionAlwaysCreated.job.id,
       directRiskCreated.job.id,
-      bannedJobId,
       manualPhoneJobId,
       phoneFallbackJobId,
       incompleteAuthorizationId,
@@ -1049,7 +783,7 @@ try {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 27);
+  assert.equal(deleted.deleted, 26);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);
@@ -1060,7 +794,7 @@ try {
 } finally {
   if (isRunning(child)) child.kill("SIGKILL");
   await Promise.race([childExit, delay(2_000)]);
-  await new Promise((resolve) => sub2api.close(resolve));
+  await new Promise((resolve) => cpr.close(resolve));
   await fs.rm(outputRoot, { recursive: true, force: true });
 }
 

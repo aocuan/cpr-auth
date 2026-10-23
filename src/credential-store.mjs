@@ -4,9 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-const KEYCHAIN_SERVICE = "com.local.chatgpt-onboarding.credentials";
-const MAC_CREDENTIAL_ROOT = path.join(os.homedir(), "Library", "Application Support", "toSub2", "credentials");
-const WINDOWS_ENTROPY = "toSub2.credentials.v1";
+const KEYCHAIN_SERVICE = "com.local.cpr-auth.credentials";
+const MAC_CREDENTIAL_ROOT = path.join(os.homedir(), "Library", "Application Support", "CPR Auth", "credentials");
+const WINDOWS_ENTROPY = "cpr-auth.credentials.v1";
+const MAX_CONCURRENT_CREDENTIAL_PROCESSES = 8;
 
 const WINDOWS_PROTECT_SCRIPT = String.raw`
 $ErrorActionPreference = "Stop"
@@ -44,8 +45,8 @@ export function createCredentialStore(options = {}) {
   const platform = options.platform || process.platform;
   const windowsRoot = path.resolve(options.windowsRoot || defaultWindowsCredentialRoot());
   const macRoot = path.resolve(options.macRoot || process.env.TOSUB2_MAC_CREDENTIAL_ROOT || MAC_CREDENTIAL_ROOT);
-  const securityRunner = options.securityRunner || runSecurity;
-  const powerShellRunner = options.powerShellRunner || runPowerShell;
+  const securityRunner = limitRunnerConcurrency(MAX_CONCURRENT_CREDENTIAL_PROCESSES, options.securityRunner || runSecurity);
+  const powerShellRunner = limitRunnerConcurrency(MAX_CONCURRENT_CREDENTIAL_PROCESSES, options.powerShellRunner || runPowerShell);
 
   return {
     async save(email, credentials) {
@@ -129,7 +130,7 @@ export function createCredentialStore(options = {}) {
 
 function defaultWindowsCredentialRoot() {
   const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
-  return path.join(localAppData, "toSub2", "credentials");
+  return path.join(localAppData, "CPR Auth", "credentials");
 }
 
 function windowsCredentialPath(root, email) {
@@ -299,6 +300,25 @@ function credentialError(status, message) {
   return error;
 }
 
+function limitRunnerConcurrency(limit, runner) {
+  let active = 0;
+  const pending = [];
+  return (...args) => new Promise((resolve, reject) => {
+    const start = () => {
+      active += 1;
+      Promise.resolve()
+        .then(() => runner(...args))
+        .then(resolve, reject)
+        .finally(() => {
+          active -= 1;
+          pending.shift()?.();
+        });
+    };
+    if (active < limit) start();
+    else pending.push(start);
+  });
+}
+
 function runSecurity(args, input = "") {
   return runChild("/usr/bin/security", args, input, { detached: true });
 }
@@ -315,20 +335,39 @@ function runPowerShell(script, input = "") {
 
 function runChild(command, args, input, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      ...options,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    let child;
+    try {
+      child = spawn(command, args, {
+        ...options,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (chunk) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      callback(value);
+    };
+    // 先挂载 error 监听，spawn 失败（如 EMFILE）时不会变成未捕获异常导致进程退出
+    child.on("error", (error) => finish(reject, error));
+    child.stdout?.on("data", (chunk) => {
       stdout = `${stdout}${chunk}`.slice(-65_536);
     });
-    child.stderr.on("data", (chunk) => {
+    child.stderr?.on("data", (chunk) => {
       stderr = `${stderr}${chunk}`.slice(-16_384);
     });
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }));
-    child.stdin.end(input);
+    // 子进程提前退出时 stdin 可能触发 EPIPE，这里吞掉避免未处理的 error 事件
+    child.stdin?.on("error", () => {});
+    child.on("close", (code) => finish(resolve, { code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }));
+    try {
+      child.stdin?.end(input);
+    } catch (error) {
+      finish(reject, error);
+    }
   });
 }
