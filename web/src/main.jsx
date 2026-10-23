@@ -32,6 +32,7 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import { SettingsDialog } from "./SettingsDialog.jsx";
 import { CprPanel, CprStatus, cprRequest } from "./CprPanel.jsx";
 
 const POLL_INTERVAL_MS = 900;
@@ -88,6 +89,11 @@ function App() {
   const [mailRequestSettingsError, setMailRequestSettingsError] = useState("");
   const [mailRequestSettingsSaving, setMailRequestSettingsSaving] = useState(false);
   const [uploadNotice, setUploadNotice] = useState("");
+  const [rotationDialog, setRotationDialog] = useState(null);
+  const [rotationBusy, setRotationBusy] = useState(false);
+  const [rotationError, setRotationError] = useState("");
+  const [currentTotpSecret, setCurrentTotpSecret] = useState("");
+  const [confirmedCurrentKey, setConfirmedCurrentKey] = useState(false);
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
@@ -175,6 +181,7 @@ function App() {
   const canForceReloginSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && forceReloginSelectedCount > 0;
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
+  const rotationSelected = selectedJobs.filter(job => job.canRotateTotp);
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && totpSetupSelectedCount > 0;
@@ -436,6 +443,40 @@ function App() {
     } finally {
       setBatchAction("");
     }
+  }
+
+  function openRotation(target) {
+    setRotationError("");
+    setCurrentTotpSecret("");
+    setConfirmedCurrentKey(false);
+    setRotationDialog(target);
+  }
+
+  function closeRotation() {
+    setCurrentTotpSecret("");
+    setConfirmedCurrentKey(false);
+    setRotationDialog(null);
+  }
+
+  async function submitRotation(event) {
+    event.preventDefault();
+    if (rotationBusy) return;
+    setRotationBusy(true);
+    setRotationError("");
+    try {
+      const batch = rotationDialog.ids;
+      const route = batch ? "/api/jobs/rotate-2fa-batch"
+        : `/api/jobs/${rotationDialog.id}/${rotationDialog.recover ? "recover-2fa" : "rotate-2fa"}`;
+      const data = await apiFetch(token, route, { method: "POST",
+        body: JSON.stringify({ ...(batch ? { ids: batch } : {}), proxyUrl: accountProxyUrl.trim(),
+          ...(rotationDialog.recover && currentTotpSecret ? { currentTotpSecret, confirmedCurrentKey } : {}) }) });
+      setUploadNotice(batch
+        ? `已开始更换 ${data.started} 个，跳过 ${data.skipped} 个，未启动 ${data.failed.length} 个${data.failed.length ? `：${data.failed.map(item => item.error).join("；")}` : ""}`
+        : rotationDialog.recover ? "已提交核对恢复，结果见任务行" : "已开始更换 2FA，结果见任务行");
+      if (batch) setSelectedJobIds(new Set());
+      closeRotation();
+    } catch (error) { setRotationError(error.message); }
+    finally { setRotationBusy(false); }
   }
 
   async function setupTotpSelected() {
@@ -732,6 +773,13 @@ function App() {
                 </button>
               )}
               {features.totpSetup && (
+                <button type="button" className="secondary-button bulk-button"
+                  onClick={() => openRotation({ ids: [...selectedJobIds], count: rotationSelected.length, skipped: selectedJobIds.size - rotationSelected.length })}
+                  disabled={!rotationSelected.length || Boolean(batchAction) || rotationBusy}>
+                  <ShieldCheck size={16} /><span>批量更换 2FA</span>
+                </button>
+              )}
+              {features.totpSetup && (
                 <button type="button" className="secondary-button bulk-button" onClick={setupTotpSelected} disabled={!canSetupTotpSelected || Boolean(batchAction)}>
                   {batchAction === "setup-2fa" ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
                   批量设置 2FA
@@ -788,6 +836,7 @@ function App() {
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
+                    onRotate={recover => openRotation({ id: job.id, email: job.email, recover })}
                     cprSyncAvailable={Boolean(features.cprSync)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
                     passwordAddAvailable={Boolean(features.passwordAdd)}
@@ -1097,6 +1146,33 @@ function App() {
           </form>
         </div>
       )}
+      {rotationDialog && <SettingsDialog title={rotationDialog.recover ? "核对恢复 2FA" : "更换 2FA"}
+        description={rotationDialog.email || `选中 ${rotationDialog.count} 个可更换账号`}
+        busy={rotationBusy} onClose={closeRotation} onSubmit={submitRotation}>
+        <p className="dialog-hint">{rotationDialog.recover
+          ? "先核对已保存的操作阶段和远端验证器，再恢复新密钥保存。结果不明确的请求不会重复提交。"
+          : "将移除旧验证器并自动启用新密钥，旧密钥会失效。新密钥确认启用并安全保存后才算完成；中断时可从任务行核对恢复。"}</p>
+        {rotationDialog.skipped > 0 && <p className="dialog-hint">另有 {rotationDialog.skipped} 个账号不符合条件，将跳过。</p>}
+        {rotationDialog.recover && <div className="provider-config-grid sub2api-config-grid">
+          <label className="settings-field wide-settings-field"><span>当前 2FA 密钥（仅人工恢复时填写）</span>
+            <input type="password" autoComplete="off" disabled={rotationBusy} value={currentTotpSecret}
+              onChange={event => { setCurrentTotpSecret(event.target.value); setConfirmedCurrentKey(false); }} placeholder="自动核对时留空" />
+          </label>
+          {currentTotpSecret && <label className="settings-field wide-settings-field sub2api-monitor-toggle">
+            <input type="checkbox" checked={confirmedCurrentKey} disabled={rotationBusy} onChange={event => setConfirmedCurrentKey(event.target.checked)} />
+            <span>我已在账号安全设置中核实此密钥有效。保存会替换本地登录密钥，不会修改远端验证器。</span>
+          </label>}
+        </div>}
+        {rotationError && <div className="dialog-error" role="alert">{rotationError}</div>}
+        <div className="dialog-actions sub2api-dialog-actions">
+          <span className="dialog-actions-spacer" />
+          <button type="button" className="secondary-button" aria-label="取消" disabled={rotationBusy} onClick={closeRotation}><X size={16} /><span>取消</span></button>
+          <button type="submit" className="primary-button" disabled={rotationBusy || Boolean(currentTotpSecret && !confirmedCurrentKey)}>
+            {rotationBusy && <LoaderCircle className="spin" size={16} />}
+            {rotationDialog.recover ? currentTotpSecret ? "保存已核实密钥" : "核对恢复" : "确认更换"}
+          </button>
+        </div>
+      </SettingsDialog>}
     </main>
   );
 }
@@ -1115,7 +1191,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, cprSyncAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, onRotate, cprSyncAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1437,6 +1513,13 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               重新登录并授权
             </button>
           )}
+          {totpSetupAvailable && (job.canRotateTotp || job.canRecoverTotp) && (
+            <button type="button" className="icon-button" onClick={() => onRotate(Boolean(job.canRecoverTotp))}
+              disabled={submitting} title={job.canRecoverTotp ? "核对恢复 2FA" : "更换 2FA"}
+              aria-label={job.canRecoverTotp ? "核对恢复 2FA" : "更换 2FA"}>
+              {job.canRecoverTotp ? <RotateCcw size={16} /> : <ShieldCheck size={16} />}
+            </button>
+          )}
           {totpSetupAvailable && job.canSetupTotp && (
             <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
@@ -1686,6 +1769,8 @@ function operationLabel(type) {
     automatic_relogin: "号池自动重登并授权",
     resume: "继续中断流程",
     setup_2fa: "设置 2FA",
+    rotate_2fa: "更换 2FA",
+    recover_2fa: "恢复 2FA",
     add_password: "添加密码",
     account_update: "更新账号资料",
     proxy_update: "更新代理 IP",

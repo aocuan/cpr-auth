@@ -9,6 +9,9 @@
 - `test/console-smoke.mjs`：保留授权任务回归，替换已移除的 Sub2API 集成为 CPR 手动同步与授权完成后的自动同步验证
 - `test/console-restore-shutdown-smoke.mjs`：恢复原授权任务，关停时取消未完成的 CPR 连接请求，等待任务取消状态落盘后正常退出；Windows 使用 PM2 的 IPC shutdown 消息，其他平台使用 SIGTERM，可加 `--ipc` 验证消息路径
 - `test/credential-store.mjs`：平台凭据隔离、批量子进程限流、Linux 密文重载、并发密钥初始化、账号绑定以及密钥丢失/损坏保护
+- `test/totp-rotation.mjs`：移除、申请密钥、激活、保存各阶段的错误与恢复，歧义因子拒绝，以及恢复不重复修改
+- `test/totp-rotation-integration.mjs`：真实控制台和协议子进程对接本机模拟账号接口，覆盖单个、批量跳过、并发冲突、新密钥加密保存与导出、断线、强制终止父进程后的恢复，以及人工核实保存
+- `test/tls-transport.mjs`：native/TLS 两条路径的 403、307、503、断连均不重放安全修改请求
 - 其余上游测试继续检查凭据存储、TLS、邮件与接码、密码/MFA 和工作区流程
 
 这些测试使用合成账号材料和模拟上游，不能证明真实上游授权成功或真实 CPR 账号可用。
@@ -23,9 +26,11 @@
 
 GitHub Actions 在 Linux 和 Windows 上执行构建与完整自动化回归，具体结果以[对应提交的运行记录](https://github.com/aocuan/cpr-auth/actions)为准。本机也已分别验证 SIGTERM 与 IPC 两种关闭路径。PM2 配置按[官方 Windows 关闭约定](https://pm2.io/docs/runtime/best-practices/graceful-shutdown/)启用 `shutdown_with_message`。
 
+更换 2FA 页面已验证单个成功、批量跳过、断线后的核对恢复、人工恢复确认必填、取消和 Escape 焦点返回。390×844 下确认弹窗宽 366 像素，页面无横向溢出；截图见 `totp-rotation-dialog.png`、`totp-rotation-mobile.png` 和 `totp-rotation-result.png`，均为合成账号。
+
 ## 仍需实际环境验收
 
-- 使用测试账号完成真实登录、验证码与授权
+- 使用测试账号完成真实登录、验证码与授权，以及真实 2FA 移除、激活和后续登录
 - 使用目标 CPR 版本完成真实入库并核对上游身份、分组、代理和凭据刷新
 - 验证真实代理出口与上游网络可达性
 - 在目标服务器验证 HTTPS、备份恢复、访问控制和长期运行

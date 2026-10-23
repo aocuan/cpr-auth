@@ -182,15 +182,42 @@ export class TlsFingerprintTransport {
   }
 
   async request(method, url, options = {}) {
+    const singleAttempt = options.singleAttempt === true;
+    const omitHeaders = [...new Set((Array.isArray(options.omitHeaders) ? options.omitHeaders : [])
+      .filter((name) => typeof name === "string" && name.trim())
+      .map((name) => name.trim().toLowerCase()))];
     if (!this.enabled) {
-      const response = await fetch(url, options);
+      let nativeOptions = options;
+      if (singleAttempt || omitHeaders.length) {
+        const headers = new Headers(options.headers || {});
+        for (const name of omitHeaders) headers.delete(name);
+        let body = options.body;
+        if (omitHeaders.includes("content-type")) {
+          // 字节请求体避免 fetch 在删除后自动补回内容类型
+          if (typeof body === "string" || body instanceof URLSearchParams) {
+            body = Buffer.from(String(body), "utf8");
+          } else if ((typeof Blob !== "undefined" && body instanceof Blob)
+            || (typeof FormData !== "undefined" && body instanceof FormData)) {
+            body = new Uint8Array(await new Response(body).arrayBuffer());
+          }
+        }
+        nativeOptions = {
+          ...options,
+          method,
+          headers,
+          body,
+          ...(singleAttempt ? { redirect: "manual" } : {}),
+        };
+      }
+      const response = await fetch(url, nativeOptions);
       return response;
     }
     if (Object.hasOwn(options, "proxy")) await this.configure(options.proxy || null);
     else if (this.configuredProxy === UNCONFIGURED) await this.configure(null);
-    const headers = options.headers instanceof Headers
+    const suppliedHeaders = options.headers instanceof Headers
       ? [...options.headers.entries()]
       : Object.entries(options.headers || {});
+    const headers = suppliedHeaders.filter(([name]) => !omitHeaders.includes(String(name).toLowerCase()));
     const body = encodeBody(options.body);
     const request = {
       operation: "request",
@@ -200,6 +227,9 @@ export class TlsFingerprintTransport {
       body,
       timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
       discardBody: Boolean(options.discardBody),
+      ...(singleAttempt ? { singleAttempt: true } : {}),
+      ...(typeof options.defaultHeaders === "boolean" ? { defaultHeaders: options.defaultHeaders } : {}),
+      ...(omitHeaders.length ? { omitHeaders } : {}),
     };
     let result;
     let retries = 0;
@@ -208,7 +238,7 @@ export class TlsFingerprintTransport {
       try {
         result = await this.send(request);
       } catch (error) {
-        if (options.retryRiskControl && this.hasConfiguredProxy() && isRetryableProxyConnectionError(error)) {
+        if (!singleAttempt && options.retryRiskControl && this.hasConfiguredProxy() && isRetryableProxyConnectionError(error)) {
           throw new Error(
             `PROXY_CONNECTION_RETRY: ${method} ${safeRequestTarget(url)} failed: ` +
               redactProxyError(error?.message || "proxy connection failed"),
@@ -216,6 +246,8 @@ export class TlsFingerprintTransport {
         }
         throw error;
       }
+      // 安全修改请求不得被传输层自动重放
+      if (singleAttempt) break;
       const riskControl = isRiskControlResult(result);
       if (
         riskControl

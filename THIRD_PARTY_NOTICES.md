@@ -18,3 +18,11 @@
 - 适配文件：`src/file-credential-store.mjs`
 - 适配内容：Linux 的 AES-256-GCM 凭据文件、邮箱 AAD 绑定和原子替换；另补密钥并发初始化、丢失和损坏保护
 - 许可：MIT，原版权声明为 `Copyright (c) 2026 poxiao33`，完整声明保留在本仓库 LICENSE
+
+## Cengyj/toSub2
+
+- 来源：https://github.com/Cengyj/toSub2/tree/9a517d442b9af4e6b56ddce616fc90814cc9276f
+- 复用文件：`src/tls-transport.mjs`、`src/tls_transport.py`、`test/tls-transport.mjs` 的单次请求策略与专项验证
+- 参考适配：2FA 移除、查询确认、新建、激活、凭据读回与父进程确认流程；在 `src/totp-rotation.mjs` 和现有协议/控制台中接入
+- CPR Auth 使用账号绑定的加密恢复记录，提供自动核对与明确标记的人工恢复；没有移植退出全部设备或独立工作台
+- 许可：MIT，原版权声明为 `Copyright (c) 2026 poxiao33`，完整声明保留在本仓库 LICENSE

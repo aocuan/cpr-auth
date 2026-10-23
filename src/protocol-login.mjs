@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
+import { createRotationStore, rotateTotp, parentAcknowledgement } from "./totp-rotation.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
@@ -162,14 +163,14 @@ class ProtocolClient {
   }
 
   async rawFetch(url, options = {}) {
-    if (this.transport) return this.transport.fetch(url, { ...options, retryRiskControl: true });
+    if (this.transport) return this.transport.fetch(url, { ...options, retryRiskControl: options.singleAttempt !== true });
     return fetch(url, options);
   }
 
   async request(method, url, options = {}) {
     const targetUrl = new URL(url);
     const headers = new Headers(options.headers || {});
-    for (const [name, value] of Object.entries(browserHeadersForTransport(this.transport))) {
+    for (const [name, value] of Object.entries(options.defaultHeaders === false ? {} : browserHeadersForTransport(this.transport))) {
       headers.set(name, value);
     }
     if (options.userAgent) headers.set("user-agent", options.userAgent);
@@ -219,6 +220,9 @@ class ProtocolClient {
         body,
         redirect: "manual",
         signal: controller.signal,
+        singleAttempt: options.singleAttempt,
+        defaultHeaders: options.defaultHeaders,
+        omitHeaders: options.omitHeaders,
         timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
       });
       this.jar.setFromResponse(url, res.headers);
@@ -239,7 +243,7 @@ class ProtocolClient {
       console.error(`< ${method} ${safeUrl(url)} ${res.status}${suffix}`);
     }
 
-    if (isRiskControlResponse(res, text)) {
+    if (!options.singleAttempt && isRiskControlResponse(res, text)) {
       throw new Error(
         `PROXY_RISK_CONTROL: ${method} ${safeUrl(url)} returned HTTP ${res.status} with a security-check page`,
       );
@@ -283,6 +287,14 @@ async function run() {
   if (args.help) {
     printHelp();
     return;
+  }
+  if (args.rotateTotp || args.recoverTotp) {
+    if ((args.rotateTotp && args.recoverTotp) || args.setupTotp || args.addPassword || args.refreshSub2api) {
+      throw new Error("2FA 更换、恢复与其他操作不能同时执行");
+    }
+    if (!process.connected || !process.env.TOSUB2_TOTP_OPERATION_ID || !process.env.TOSUB2_TOTP_ROTATION_ROOT) {
+      throw new Error("更换 2FA 必须通过控制台的安全保存通道执行");
+    }
   }
 
   const chatgptBase = trimSlash(args.chatgptBase || process.env.CHATGPT_BASE || DEFAULT_CHATGPT_BASE);
@@ -418,6 +430,51 @@ async function run() {
         }
       } finally {
         rl.close();
+      }
+      return;
+    }
+    if (args.rotateTotp || args.recoverTotp) {
+      const store = createRotationStore(process.env.TOSUB2_TOTP_ROTATION_ROOT);
+      const email = String(args.email || "").toLowerCase();
+      const state = await store.load(email);
+      if (!state || state.operationId !== process.env.TOSUB2_TOTP_OPERATION_ID) throw new Error("2FA 操作记录不匹配");
+      let cookies = state.cookies || [];
+      if (!args.recoverTotp && args.resumeCheckpoint && !cookies.length) {
+        try {
+          const checkpoint = await readProtocolCheckpoint(path.resolve(args.resumeCheckpoint));
+          if (checkpoint.email.toLowerCase() === email) cookies = checkpoint.cookies || [];
+        } catch {}
+      }
+      let client = new ProtocolClient({ transport, jar: CookieJar.fromJSON(cookies) });
+      const rl = readline.createInterface({ input, output });
+      // 父进程消失时立即停止，防止重启后的恢复与遗留子进程同时修改账号
+      const parentGone = () => process.exit(1);
+      process.once("disconnect", parentGone);
+      try {
+        if (!cookies.length && !args.recoverTotp) {
+          console.log("[rotation] 正在验证账号登录");
+          await loginChatgptWeb(client, { chatgptBase, authBase, email, rl,
+            password: process.env.CHATGPT_LOGIN_PASSWORD || "", totpSecret: process.env.CHATGPT_TOTP_SECRET || "" });
+        }
+        try {
+          await executeTotpRotation(client, { state, store, chatgptBase, recover: Boolean(args.recoverTotp) });
+        } catch (error) {
+          if (args.recoverTotp || !cookies.length || state.phase !== "pending" || error.code !== "ROTATION_SESSION_INVALID") throw error;
+          client = new ProtocolClient({ transport });
+          await loginChatgptWeb(client, { chatgptBase, authBase, email, rl,
+            password: process.env.CHATGPT_LOGIN_PASSWORD || "", totpSecret: process.env.CHATGPT_TOTP_SECRET || "" });
+          await executeTotpRotation(client, { state, store, chatgptBase, recover: false });
+        }
+      } catch (error) {
+        if (state.phase === "pending") {
+          state.error = error.code === "ROTATION_SESSION_INVALID" ? error.message : "账号登录验证未完成，尚未发起更换，可核对恢复后重新开始";
+          await store.save(state).catch(() => {});
+        }
+        throw error;
+      } finally {
+        rl.close();
+        process.off("disconnect", parentGone);
+        if (process.connected) process.disconnect();
       }
       return;
     }
@@ -838,6 +895,51 @@ function isNewPasswordPage(value) {
   } catch {
     return false;
   }
+}
+
+async function executeTotpRotation(client, { state, store, chatgptBase, recover }) {
+  // 只接受属于目标邮箱的网页登录会话，不把 Codex OAuth 令牌当作网页凭据
+  const sessionResponse = await client.request("GET", `${chatgptBase}/api/auth/session`, { singleAttempt: true });
+  let session;
+  try { session = JSON.parse(sessionResponse.text); } catch {}
+  if (sessionResponse.res.status !== 200 || String(session?.user?.email || "").toLowerCase() !== state.email || !session.accessToken) {
+    throw Object.assign(new Error("网页登录会话无效或账号不匹配，请在账号安全设置中核实；未发送更换请求"), { code: "ROTATION_SESSION_INVALID" });
+  }
+  const identity = browserIdentityForTransport(client.transport);
+  const headers = {
+    authorization: `Bearer ${session.accessToken}`, accept: "application/json",
+    "user-agent": identity.userAgent, "sec-ch-ua": identity.secChUa,
+    "sec-ch-ua-mobile": identity.secChUaMobile, "sec-ch-ua-platform": identity.secChUaPlatform,
+    "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors", "sec-fetch-dest": "empty", priority: "u=1, i",
+    "oai-did": client.jar.value("oai-did", `${chatgptBase}/`) || crypto.randomUUID(),
+    originator: "web",
+  };
+  const sessionAccount = session.account?.id || session.account_id;
+  let tokenAccount;
+  try { tokenAccount = decodeJwtPayload(session.accessToken)?.["https://api.openai.com/auth"]?.chatgpt_account_id; } catch {}
+  if ((sessionAccount && tokenAccount && sessionAccount !== tokenAccount) || !(sessionAccount || tokenAccount)) {
+    throw new Error("当前网页登录账号上下文不明确，未发送更换请求");
+  }
+  headers["chatgpt-account-id"] = sessionAccount || tokenAccount;
+  const request = async (method, endpoint, payload) => {
+    let response;
+    try {
+      response = await client.request(method, `${chatgptBase}/backend-api/accounts/${endpoint}`, {
+        headers, referer: `${chatgptBase}/`, origin: chatgptBase,
+        ...(payload ? { json: payload } : {}), singleAttempt: true, defaultHeaders: false,
+      });
+    } catch { throw new Error("账号安全请求中断，结果未确认，请核对恢复"); }
+    if (response.res.status < 200 || response.res.status >= 300) throw new Error(`账号安全接口返回 HTTP ${response.res.status}，请核对恢复`);
+    try { return JSON.parse(response.text); } catch { throw new Error("账号安全接口返回无法识别的结果，请核对恢复"); }
+  };
+  await rotateTotp({ state, request, recover, generateCode: generateTotp,
+    save: async value => {
+      if (value.phase !== "committed") value.cookies = client.jar.toJSON();
+      await store.save(value);
+      console.log(`[rotation] ${value.phase}`);
+    },
+    acknowledge: stage => parentAcknowledgement(state.operationId, stage),
+  });
 }
 
 async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resultPath }) {
@@ -2286,6 +2388,8 @@ function parseArgs(argv) {
     else if (item === "--debug-auth") args.debugAuth = true;
     else if (item === "--web-only") args.webOnly = true;
     else if (item === "--setup-totp") args.setupTotp = true;
+    else if (item === "--rotate-totp") args.rotateTotp = true;
+    else if (item === "--recover-totp") args.recoverTotp = true;
     else if (item === "--add-password") args.addPassword = true;
     else if (item.startsWith("--password-add-result=")) args.passwordAddResult = item.slice("--password-add-result=".length);
     else if (item === "--password-add-result") args.passwordAddResult = argv[++i];

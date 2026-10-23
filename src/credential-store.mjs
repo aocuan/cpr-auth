@@ -75,7 +75,7 @@ export function createCredentialStore(options = {}) {
         }
         await fs.mkdir(windowsRoot, { recursive: true });
         const filePath = windowsCredentialPath(windowsRoot, email);
-        await fs.writeFile(filePath, `${result.stdout.trim()}\n`, { mode: 0o600 });
+        await writeCredentialFile(filePath, `${result.stdout.trim()}\n`);
         return;
       }
       throw credentialError(501, "持久保存登录凭据和代理配置目前支持 macOS Keychain（钥匙串）和 Windows DPAPI（数据保护接口）");
@@ -176,12 +176,9 @@ async function saveMacCredential(root, email, payload, securityRunner) {
   }
   const encrypted = encryptCredentialPayload(key, payload);
   await fs.mkdir(root, { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   try {
-    await fs.writeFile(tempPath, `${JSON.stringify(encrypted)}\n`, { mode: 0o600 });
-    await fs.rename(tempPath, filePath);
+    await writeCredentialFile(filePath, `${JSON.stringify(encrypted)}\n`);
   } catch (error) {
-    await fs.rm(tempPath, { force: true }).catch(() => {});
     throw credentialError(500, `无法写入 macOS 凭据文件：${error.message}`);
   }
 }
@@ -378,4 +375,18 @@ function runChild(command, args, input, options = {}) {
       finish(reject, error);
     }
   });
+}
+
+// 替换前同步密文文件，避免新密钥已启用但本地凭据只写入缓存
+async function writeCredentialFile(filePath, data) {
+  const temporary = `${filePath}.${crypto.randomUUID()}.tmp`;
+  try {
+    const file = await fs.open(temporary, "wx", 0o600);
+    try { await file.writeFile(data); await file.sync(); } finally { await file.close(); }
+    await fs.rename(temporary, filePath);
+    if (process.platform !== "win32") {
+      const dir = await fs.open(path.dirname(filePath), "r");
+      try { await dir.sync(); } finally { await dir.close(); }
+    }
+  } finally { await fs.rm(temporary, { force: true }); }
 }

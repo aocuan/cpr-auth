@@ -11,6 +11,7 @@ import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createStaticWeb } from "./static-web.mjs";
 import { createCprConnector } from "./cpr-connector.mjs";
+import { createRotationStore, rotationView, ROTATION_TERMINAL } from "./totp-rotation.mjs";
 import { createCredentialStore } from "./credential-store.mjs";
 import {
   fetchMailboxOtpCandidates,
@@ -64,6 +65,9 @@ const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
 const credentialStore = createCredentialStore();
+const rotationRoot = path.join(OUTPUT_ROOT, "totp-rotations");
+const rotationStore = createRotationStore(rotationRoot);
+const rotationStates = new Map();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
 const deletedJobIds = new Set();
@@ -395,6 +399,19 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/rotate-2fa-batch") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const results = await Promise.all(selected.map(job => withEmailJobLock(job.email, async () => {
+      if (!canRotateTotp(job)) return { skipped: true };
+      try { await startTotpRotation(job, body); return { id: job.id }; }
+      catch (error) { return { id: job.id, error: error.message }; }
+    })));
+    sendJson(res, 200, { started: results.filter(r => r.id && !r.error).length,
+      skipped: results.filter(r => r.skipped).length, failed: results.filter(r => r.error) });
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/setup-2fa-batch") {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
@@ -456,7 +473,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logs|download|session|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|rotate-2fa|recover-2fa|add-password|logs|download|session|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -511,6 +528,12 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && action === "relogin") {
     const body = await readJson(req);
     await withEmailJobLock(job.email, () => forceReloginJob(job, body));
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
+  if (req.method === "POST" && ["rotate-2fa", "recover-2fa"].includes(action)) {
+    const body = await readJson(req);
+    await withEmailJobLock(job.email, () => startTotpRotation(job, body, action === "recover-2fa"));
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
@@ -708,12 +731,15 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
-    if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
+    if (mode !== "totp_rotate") await assertNoRotation(job.email);
+    if (["full", "totp_setup", "totp_rotate", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (job.deleted || !isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {
     if (job.deleted || job.queueRunId !== queueRunId) return;
-    if (mode === "totp_setup") {
+    if (mode === "totp_rotate") {
+      await finishTotpRotation(job);
+    } else if (mode === "totp_setup") {
       restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
     } else if (mode === "password_add") {
       restorePasswordAddFailure(job, `准备添加密码失败：${error.message}`);
@@ -746,7 +772,9 @@ function launchJob(job, options = {}) {
   job.runId = runId;
   job.runMode = mode;
   job.mailOtpRequestedAt = null;
-  const args = mode === "refresh"
+  const args = mode === "totp_rotate"
+    ? [PROTOCOL_SCRIPT, "--email", job.email, job.totpRotationRecover ? "--recover-totp" : "--rotate-totp", "--resume-checkpoint", job.checkpointPath]
+    : mode === "refresh"
     ? [
         PROTOCOL_SCRIPT,
         "--refresh-sub2api",
@@ -803,6 +831,8 @@ function launchJob(job, options = {}) {
     cwd: WORKSPACE_ROOT,
     env: {
       ...process.env,
+      TOSUB2_TOTP_OPERATION_ID: mode === "totp_rotate" ? job.totpOperationId : "",
+      TOSUB2_TOTP_ROTATION_ROOT: rotationRoot,
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
@@ -812,9 +842,14 @@ function launchJob(job, options = {}) {
         String(process.env.TOSUB2_TLS_PROFILE || "").trim()
         || (!job.proxyUrl ? String(options.tlsProfile || DEFAULT_TLS_PROFILE) : ""),
     },
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: mode === "totp_rotate" ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });
   job.child = child;
+  if (mode === "totp_rotate") {
+    child.on("message", message => {
+      void withEmailJobLock(job.email, () => acknowledgeRotation(job, child, runId, message));
+    });
+  }
 
   child.stdout.on("data", (chunk) => {
     if (job.runId === runId) consumeOutput(job, chunk.toString("utf8"));
@@ -825,6 +860,7 @@ function launchJob(job, options = {}) {
   child.on("error", (error) => {
     void withEmailJobLock(job.email, async () => {
       if (job.runId !== runId) return;
+      if (mode === "totp_rotate") { await finishTotpRotation(job); return; }
       if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
       else if (mode === "password_add") restorePasswordAddFailure(job, `无法启动添加密码进程：${error.message}`);
       else failJob(job, `无法启动登录进程：${error.message}`);
@@ -842,6 +878,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
   if (job.runId !== runId) return;
   stopMailPolling(job);
   job.child = null;
+  if (mode === "totp_rotate") { await finishTotpRotation(job); scheduleQueuedJobs(); return; }
   if (mode === "totp_setup") {
     await finishTotpSetup(job, code, signal);
     scheduleQueuedJobs();
@@ -903,6 +940,7 @@ function handleChildCloseFailure(job, mode, runId, error) {
 }
 
 async function retryJob(job, options = {}) {
+  await assertNoRotation(job.email);
   if (!["failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
@@ -953,6 +991,7 @@ async function retryJob(job, options = {}) {
 }
 
 async function regenerateJob(job, options = {}) {
+  await assertNoRotation(job.email);
   if (job.status !== "completed" || !job.resultSaved) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
@@ -980,6 +1019,7 @@ async function regenerateJob(job, options = {}) {
 }
 
 async function forceReloginJob(job, options = {}, context = {}) {
+  await assertNoRotation(job.email);
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
@@ -1058,7 +1098,148 @@ async function reloadMissingJobCredentials(job) {
   }
 }
 
+function rotationBlocked(email) {
+  return rotationStates.get(email.toLowerCase())?.recoveryRequired === true;
+}
+
+function emailHasActiveJob(email) {
+  return [...jobs.values()].some(job => job.email.toLowerCase() === email.toLowerCase() && isActive(job.status));
+}
+
+async function assertNoRotation(email) {
+  const state = await rotationStore.load(email);
+  rotationStates.set(email.toLowerCase(), rotationView(state));
+  if (state && !ROTATION_TERMINAL.has(state.phase)) throw httpError(409, "2FA 更换正在进行或需要恢复，请先核对恢复");
+}
+
+function canRotateTotp(job) {
+  return !rotationBlocked(job.email) && !emailHasActiveJob(job.email)
+    && Boolean(job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled)
+    && ["completed", "failed", "canceled", "resume_available", "reauth_required"].includes(job.status);
+}
+
+async function startTotpRotation(job, options, recover = false) {
+  if (shuttingDown) throw httpError(503, "服务正在关闭，请稍后重试");
+  if (job.deleted || jobs.get(job.id) !== job) throw httpError(404, "该任务已删除，请刷新页面");
+  if (emailHasActiveJob(job.email)) throw httpError(409, "该账号仍有任务进行中");
+  let state = await rotationStore.load(job.email);
+  if (recover) {
+    if (!state || ROTATION_TERMINAL.has(state.phase)) throw httpError(409, "当前没有需要恢复的 2FA 更换");
+    recordJobOperation(job, "recover_2fa");
+    job.totpOperationId = state.operationId;
+    if (options.currentTotpSecret) {
+      if (options.confirmedCurrentKey !== true) throw httpError(400, "请确认已在账号安全设置中核实当前密钥有效");
+      const secret = normalizeTotpSecret(options.currentTotpSecret);
+      // 人工核实与远端自动确认分开记录，保存失败时仍保留原恢复记录
+      const resolved = { ...state, phase: "verified", secret, manualReconciliation: true, reconciledAt: new Date().toISOString() };
+      await rotationStore.save(resolved);
+      await persistRotatedCredential(resolved);
+      await rotationStore.save({ ...resolved, phase: "reconciled", error: null,
+        secret: undefined, cookies: undefined, enrollmentId: undefined });
+      await finishTotpRotation(job);
+      return;
+    }
+    if (state.phase === "verified") {
+      await persistRotatedCredential(state);
+      await rotationStore.save({ ...state, phase: state.manualReconciliation ? "reconciled" : "committed", error: null, secret: undefined, cookies: undefined, enrollmentId: undefined });
+      await finishTotpRotation(job);
+      return;
+    }
+    if (state.phase === "pending") {
+      await rotationStore.save({ ...state, phase: "unchanged", error: null, cookies: undefined });
+      await finishTotpRotation(job);
+      return;
+    }
+  } else {
+    await assertNoRotation(job.email);
+    if (!canRotateTotp(job)) throw httpError(409, "该账号当前不能更换 2FA");
+    await reloadMissingJobCredentials(job);
+    if (Object.hasOwn(options, "proxyUrl")) job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    state = { version: 1, email: job.email.toLowerCase(), jobId: job.id,
+      operationId: crypto.randomUUID(), phase: "pending", createdAt: new Date().toISOString() };
+    await rotationStore.save(state);
+  }
+  rotationStates.set(job.email.toLowerCase(), rotationView(state));
+  job.totpOperationId = state.operationId;
+  job.totpRotationRecover = recover;
+  job.lastError = null;
+  job.totpSetupError = null;
+  job.parserTail = "";
+  recordJobOperation(job, recover ? "recover_2fa" : "rotate_2fa");
+  // 元数据先写入，保证中断后仍能定位所属任务；恢复不会自动发起远端修改
+  await saveJobMetadata(job);
+  enqueueJob(job, "totp_rotate", recover ? "正在核对 2FA 更换结果" : "正在验证账号并更换 2FA");
+}
+
+async function persistRotatedCredential(state) {
+  if (state.phase !== "verified" || !state.secret) throw new Error("新验证器尚未核实");
+  const secret = normalizeTotpSecret(state.secret);
+  const previous = await credentialStore.load(state.email);
+  await credentialStore.save(state.email, { ...previous, totpSecret: secret });
+  const verified = await credentialStore.load(state.email);
+  if (verified.totpSecret !== secret) throw new Error("新密钥保存后的读取验证失败");
+  for (const job of jobs.values()) {
+    if (job.email.toLowerCase() !== state.email) continue;
+    job.totpSecret = secret;
+    job.hasTotpCredential = true;
+    job.totpKnownEnabled = true;
+  }
+}
+
+async function acknowledgeRotation(job, child, runId, message) {
+  if (message?.type !== "rotation-ready" || message.operationId !== job.totpOperationId
+    || !["preflight", "credential"].includes(message.stage)) return;
+  const current = () => !shuttingDown && !job.deleted && job.child === child && job.runId === runId;
+  if (!current()) return;
+  let ok = false;
+  try {
+    const state = await rotationStore.load(job.email);
+    if (state?.operationId !== message.operationId) throw new Error("操作记录不匹配");
+    if (message.stage === "preflight") {
+      if (state.phase !== "pending") throw new Error("操作阶段不匹配");
+      const stored = await credentialStore.load(job.email);
+      const expected = { password: job.password || stored.password || "", totpSecret: job.totpSecret || stored.totpSecret || "", proxyUrl: job.proxyUrl || stored.proxyUrl || "" };
+      await credentialStore.save(job.email, expected);
+      const actual = await credentialStore.load(job.email);
+      if (Object.keys(expected).some(key => expected[key] !== (actual[key] || ""))) throw new Error("凭据存储预检失败");
+      // 失效的历史检查点不能在中断后重新用于旧密钥登录
+      await removePrivateFile(job.checkpointPath);
+      job.loginCheckpointAvailable = false;
+    } else {
+      await persistRotatedCredential(state);
+    }
+    await saveJobMetadata(job);
+    ok = true;
+  } catch { job.lastError = "2FA 安全保存未确认，恢复材料已保留"; }
+  if (current() && child.connected) {
+    child.send({ type: "rotation-ack", operationId: message.operationId, stage: message.stage, ok }, () => {});
+  }
+}
+
+async function finishTotpRotation(job) {
+  let state;
+  try {
+    state = await rotationStore.load(job.email);
+    rotationStates.set(job.email.toLowerCase(), rotationView(state));
+  } catch {
+    rotationStates.set(job.email.toLowerCase(), { phase: "unreadable", recoveryRequired: true, error: "恢复记录无法读取，请恢复完整备份" });
+  }
+  const done = state?.phase === "committed";
+  const reconciled = state?.phase === "reconciled";
+  const unchanged = state?.phase === "unchanged";
+  job.status = done || reconciled || unchanged ? (job.resultSaved ? "completed" : "reauth_required") : "failed";
+  job.prompt = done ? "2FA 已更换，新密钥已安全保存" : reconciled ? "已保存人工核实的当前 2FA 密钥" : unchanged ? "2FA 未更改，可重新发起更换" : "2FA 更换未完成，请核对恢复";
+  job.lastError = done || reconciled || unchanged ? null : state?.error || "操作已中断，恢复记录已保留，不会自动重复更换";
+  job.runMode = null;
+  job.queuedMode = null;
+  job.runId = null;
+  job.queueRunId = null;
+  touch(job);
+  await saveJobMetadata(job);
+}
+
 async function startTotpSetup(job, options = {}) {
+  await assertNoRotation(job.email);
   if (!canSetupTotp(job)) {
     throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未设置 2FA 的账号设置 2FA");
   }
@@ -1105,6 +1286,7 @@ async function startTotpSetup(job, options = {}) {
 }
 
 async function startPasswordAdd(job, options = {}) {
+  await assertNoRotation(job.email);
   if (!canAddPassword(job)) {
     throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未保存密码的账号添加密码");
   }
@@ -1385,6 +1567,18 @@ function consumeOutput(job, rawText) {
     .replace(/^\[proxy-session-attempt\][^\r\n]*(?:\r?\n)?/gim, "");
   job.logs = `${job.logs}${text}`.slice(-MAX_LOG_CHARS);
   const scan = `${job.parserTail}${text}`;
+  if (job.runMode === "totp_rotate") {
+    const phase = [...scan.matchAll(/\[rotation\] ([a-z_]+)/g)].at(-1)?.[1];
+    const progress = {
+      disable_intent: "正在移除旧验证器",
+      disabled: "旧验证器已移除，准备创建新密钥",
+      enroll_intent: "正在申请新验证器",
+      enrolled: "新密钥已保存，准备激活",
+      activation_intent: "正在激活并核对新验证器",
+      verified: "新验证器已启用，正在保存登录密钥",
+    }[phase];
+    if (progress) setStage(job, "working", progress);
+  }
   job.parserTail = scan.slice(-2_000);
 
   if (scan.includes("[3/5] Password login page reached.")) {
@@ -1617,6 +1811,7 @@ function consumeOutput(job, rawText) {
 }
 
 async function restartAfterProxyRisk(job, options = {}) {
+  if (job.runMode === "totp_rotate") return;
   if (job.proxyRiskRestarting || isTerminalStatus(job.status)) return;
   job.proxyRiskRestarting = true;
   const mode = job.runMode || job.queuedMode || "full";
@@ -2072,6 +2267,18 @@ function safeSmsProviderError(error, apiKey = "") {
     .slice(0, 220);
 }
 
+async function saveInteractiveLoginCredentials(job, credentials) {
+  if (job.runMode === "totp_rotate") {
+    const state = await rotationStore.load(job.email);
+    if (state?.operationId !== job.totpOperationId || state.phase !== "pending") {
+      throw httpError(409, "2FA 修改已开始，不能覆盖登录资料");
+    }
+    await credentialStore.save(job.email, credentials);
+    return;
+  }
+  await saveStoredLoginCredentials(job.email, credentials);
+}
+
 async function submitJobInput(job, body, options = {}) {
   if (!job.child || !isActive(job.status)) {
     throw httpError(409, "This login flow is not waiting for input");
@@ -2084,7 +2291,7 @@ async function submitJobInput(job, body, options = {}) {
   if (action === "password") {
     requireStage(job, "password");
     if (!rawValue) throw httpError(400, "密码不能为空");
-    await saveStoredLoginCredentials(job.email, {
+    await saveInteractiveLoginCredentials(job, {
       password: rawValue,
       totpSecret: job.totpSecret,
       proxyUrl: job.proxyUrl,
@@ -2171,6 +2378,19 @@ async function submitJobInput(job, body, options = {}) {
 
 async function cancelJob(job) {
   if (!isActive(job.status)) return;
+  if (job.runMode === "totp_rotate" || job.queuedMode === "totp_rotate") {
+    stopMailPolling(job);
+    job.queueRunId = null;
+    job.runId = null;
+    const child = job.child;
+    const exited = waitForChildExit(child, 3000);
+    child?.kill("SIGTERM");
+    await exited;
+    job.child = null;
+    await finishTotpRotation(job);
+    scheduleQueuedJobs();
+    return;
+  }
   if (job.runMode === "totp_setup" || job.queuedMode === "totp_setup") {
     stopMailPolling(job);
     job.runId = crypto.randomUUID();
@@ -2319,6 +2539,7 @@ async function exportSourceAccounts(res, ids) {
   const selected = resolveSelectedJobs(ids);
   const lines = [];
   for (const job of selected) {
+    await assertNoRotation(job.email);
     let password = job.password || "";
     let totpSecret = job.totpSecret || "";
     if ((!password && job.hasPasswordCredential) || (!totpSecret && job.hasTotpCredential)) {
@@ -2388,7 +2609,7 @@ function publicJob(job) {
     canCopySession: Boolean(job.sessionPath && job.sessionUpdatedAt),
     sessionUpdatedAt: job.sessionUpdatedAt || null,
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
-    hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
+    hasTotpKey: !rotationBlocked(job.email) && Boolean(job.totpSecret || job.hasTotpCredential),
     autoEmailOtp: Boolean(job.mailApiUrl),
     mailStatus: job.mailStatus,
     mailApiError: job.mailApiError,
@@ -2405,11 +2626,14 @@ function publicJob(job) {
     smsStatus: job.smsStatus,
     smsError: job.smsError,
     securityCheckRequired: Boolean(job.securityCheckRequired),
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canRetry: !rotationBlocked(job.email) && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canResume: job.status === "resume_available",
-    canRegenerate: job.status === "completed" && job.resultSaved,
+    canRegenerate: !rotationBlocked(job.email) && job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
+    canRotateTotp: canRotateTotp(job),
+    canRecoverTotp: rotationBlocked(job.email) && !emailHasActiveJob(job.email),
+    totpRotation: rotationStates.get(job.email.toLowerCase()) || null,
     canAddPassword: canAddPassword(job),
     restartRequired: job.restartRequired,
     proxyConfigured: Boolean(job.proxyUrl),
@@ -2431,19 +2655,24 @@ function publicSelectionJob(job) {
     email: job.email,
     status: job.status,
     canDownload: Boolean(job.resultSaved),
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
-    canRegenerate: job.status === "completed" && job.resultSaved,
+    canRetry: !rotationBlocked(job.email) && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canRegenerate: !rotationBlocked(job.email) && job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
+    canRotateTotp: canRotateTotp(job),
+    canRecoverTotp: rotationBlocked(job.email) && !emailHasActiveJob(job.email),
+    totpRotation: rotationStates.get(job.email.toLowerCase()) || null,
     canAddPassword: canAddPassword(job),
   };
 }
 
 function canForceRelogin(job) {
+  if (rotationBlocked(job.email)) return false;
   return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 }
 
 function canSetupTotp(job) {
+  if (rotationBlocked(job.email)) return false;
   if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
@@ -2451,6 +2680,7 @@ function canSetupTotp(job) {
 }
 
 function canAddPassword(job) {
+  if (rotationBlocked(job.email)) return false;
   if (job.password || job.hasPasswordCredential) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
@@ -2640,6 +2870,7 @@ function resolveSelectedJobs(ids) {
 }
 
 async function deleteJobsByEmail(email) {
+  await assertNoRotation(email);
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
   const directories = new Set();
   const childWaits = [];
@@ -2969,6 +3200,34 @@ async function syncCompletedOutputs(force = false) {
         });
       }
     }));
+    for (const email of new Set([...jobs.values()].map(job => job.email.toLowerCase()))) {
+      try {
+        const state = await rotationStore.load(email);
+        rotationStates.set(email, rotationView(state));
+        if (state && ROTATION_TERMINAL.has(state.phase)) {
+          for (const job of jobs.values()) {
+            if (job.email.toLowerCase() === email && !job.runId && !job.queueRunId
+              && job.totpOperationId === state.operationId && ["rotate_2fa", "recover_2fa"].includes(job.lastOperationType)) {
+              job.status = job.resultSaved ? "completed" : "reauth_required";
+              job.lastError = null;
+              job.prompt = state.phase === "committed" ? "2FA 已更换，新密钥已安全保存"
+                : state.phase === "reconciled" ? "已保存人工核实的当前 2FA 密钥" : "2FA 未更改，可重新发起更换";
+            }
+          }
+        }
+        if (state && !ROTATION_TERMINAL.has(state.phase)) {
+          for (const job of jobs.values()) {
+            if (job.email.toLowerCase() === email && !job.runId && !job.queueRunId) {
+              job.status = "failed";
+              job.queuedMode = null;
+              job.prompt = "2FA 更换未完成，请核对恢复";
+            }
+          }
+        }
+      } catch {
+        rotationStates.set(email, { phase: "unreadable", recoveryRequired: true, error: "2FA 恢复记录无法读取，请恢复完整备份" });
+      }
+    }
   })().finally(() => {
     outputSyncPromise = null;
   });
@@ -2987,6 +3246,11 @@ async function recoverActivatedTotpCredential({ email, resultPath, credentials }
     return { credentials, recovered: false, error: null };
   }
   try {
+    const rotation = await rotationStore.load(email);
+    if (rotation && (!ROTATION_TERMINAL.has(rotation.phase)
+      || !(Date.parse(result.activated_at) > Date.parse(rotation.reconciledAt || rotation.updatedAt || rotation.createdAt)))) {
+      return { credentials, recovered: false, error: null };
+    }
     const secret = normalizeTotpSecret(result.secret);
     const nextCredentials = { ...credentials, totpSecret: secret };
     const persisted = await saveStoredLoginCredentials(email, nextCredentials);
@@ -3195,6 +3459,7 @@ function restoredCredentialFlags(metadata = {}, credentials = {}) {
 
 function restoredTotpSetupState(metadata = {}, credentials = {}) {
   return {
+    totpOperationId: metadata.totp_operation_id || null,
     totpSetupSecret: null,
     totpSetupUri: null,
     totpSetupError: null,
@@ -3668,6 +3933,7 @@ function escapeRegExp(value) {
 }
 
 async function updateJobCredentials(job, credentials, options = {}) {
+  await assertNoRotation(job.email);
   if (credentials.preserveExistingCredentials) await reloadMissingJobCredentials(job);
   const normalized = credentials.preserveExistingCredentials
     ? normalizeLoginCredentials({
@@ -3772,6 +4038,7 @@ async function saveJobMetadata(job) {
         has_password: Boolean(job.password || job.hasPasswordCredential),
         has_totp_key: Boolean(job.totpSecret || job.hasTotpCredential),
         totp_known_enabled: Boolean(job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential),
+        totp_operation_id: job.totpOperationId || null,
         password_add_error: job.passwordAddError || null,
         password_added_at: job.passwordAddedAt || null,
         login_checkpoint_available: Boolean(job.loginCheckpointAvailable),
@@ -3806,6 +4073,7 @@ async function saveJobMetadata(job) {
 }
 
 async function saveStoredLoginCredentials(email, credentials = {}) {
+  await assertNoRotation(email);
   const password = typeof credentials.password === "string" ? credentials.password : "";
   const totpSecret = credentials.totpSecret ? normalizeTotpSecret(credentials.totpSecret) : "";
   const proxyUrl = credentials.proxyUrl ? normalizeProxyUrl(credentials.proxyUrl) : "";

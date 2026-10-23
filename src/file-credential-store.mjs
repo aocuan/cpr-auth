@@ -1,4 +1,4 @@
-// Linux 凭据加密存储；参考 DomenLee/toSub2 的账号绑定信封，密钥与数据必须一起备份
+// 账号绑定的加密文件存储；参考 DomenLee/toSub2，密钥与数据必须一起备份
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -18,9 +18,9 @@ export function createFileCredentialStore(root) {
       key = crypto.randomBytes(32);
       const temporary = `${keyPath}.${crypto.randomUUID()}.tmp`;
       try {
-        await fs.writeFile(temporary, key, { mode: 0o600, flag: "wx" });
+        await writeDurable(temporary, key);
         // 完整写入后原子创建链接，避免并发初始化读到尚未写完的密钥
-        try { await fs.link(temporary, keyPath); }
+        try { await fs.link(temporary, keyPath); await syncDirectory(root); }
         catch (writeError) {
           if (writeError.code !== "EEXIST") throw writeError;
           key = await fs.readFile(keyPath);
@@ -41,8 +41,9 @@ export function createFileCredentialStore(root) {
       const target = filename(email);
       const temporary = `${target}.${crypto.randomUUID()}.tmp`;
       try {
-        await fs.writeFile(temporary, JSON.stringify({ version: 1, iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), data: data.toString("base64") }), { mode: 0o600 });
+        await writeDurable(temporary, JSON.stringify({ version: 1, iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), data: data.toString("base64") }));
         await fs.rename(temporary, target);
+        await syncDirectory(root);
       } finally { await fs.rm(temporary, { force: true }); }
     },
     async load(email) {
@@ -60,4 +61,18 @@ export function createFileCredentialStore(root) {
     },
     async delete(email) { await fs.rm(filename(email), { force: true }); },
   };
+}
+
+async function writeDurable(target, data) {
+  const file = await fs.open(target, "wx", 0o600);
+  try { await file.writeFile(data); await file.sync(); }
+  finally { await file.close(); }
+}
+
+async function syncDirectory(root) {
+  // Windows 不支持目录句柄 fsync，仍对密文与密钥文件执行同步写入
+  if (process.platform === "win32") return;
+  const directory = await fs.open(root, "r");
+  try { await directory.sync(); }
+  finally { await directory.close(); }
 }

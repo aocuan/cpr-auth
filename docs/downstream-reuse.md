@@ -8,6 +8,8 @@
 
 数据库迁移尚未实施。当前已吸收凭据子进程并发限制、运行期间的删除与启动/恢复互斥检查，以及 Linux 加密凭据文件存储；其他条目仍是评估或待实现项
 
+2FA 单个、批量更换与中断恢复已参考 Cengyj/toSub2 接入，使用与边界见 [2FA 更换与恢复](totp-rotation.md)
+
 ## 参考项目与适用范围
 
 | 项目与核对提交 | 已检查的实现 | 复用判断 |
@@ -16,6 +18,7 @@
 | [doublelzz/toSub2](https://github.com/doublelzz/toSub2/tree/958007bb8bbfee617b1f24564692c649538b27f4) | `task-query.mjs`、`account-insights.mjs`、`mfa-workspace.mjs`、Hero SMS、SMS 价格选择与失败轮换 | 搜索/状态/日期筛选及日志值得复用；其工作台换肤不纳入。套餐信息必须核对真实接口；CPR 用量不在本地另建口径 |
 | [DomenLee/toSub2](https://github.com/DomenLee/toSub2/tree/dd66b41a2a5d58ba3fc7b25eeeff4acc50726111) | `deploy/server/security.mjs`、身份绑定、同步队列、401 修复限流与部署测试 | Linux 凭据加密、同步与登录分离、修复次数持久化值得适配；Sub2API 回写、累计扣费与级联删除不能直接换 URL 使用 |
 | [zhoudashuaibi/tosub2V3](https://github.com/zhoudashuaibi/tosub2V3/tree/fa639ca20d3d0fbf442e6f462407cfde9f171671) | `server/lib/db.js`、`crypto.js`、SQL 迁移、任务引擎、备份脚本 | SQLite/WAL、账号与任务分离、事件记录、服务端分页是主要参考；当前版已移除本地登录并改用 redeem401 远端服务，不能直接作为我们的授权底座 |
+| [Cengyj/toSub2](https://github.com/Cengyj/toSub2/tree/9a517d442b9af4e6b56ddce616fc90814cc9276f) | Node 版 2FA 重置、父进程保存确认、禁止修改请求重放 | 已参考接入单个与批量更换，沿用原 UI，恢复材料改为加密存储 |
 | [Cengyj/toSub2-go-port](https://github.com/Cengyj/toSub2-go-port/tree/ae6806ea80da525ae8e40f10a10f5c6b07427fa9) | `internal/store/store.go`、凭据与恢复模块、单二进制构建 | 可借鉴原子文件、文件同步与恢复边界；仍有 JSON 文件存储，不是现成 SQLite 方案。整体采用需要重写 Node 运行路径 |
 | [1080ssf/codex-navo](https://github.com/1080ssf/codex-navo/tree/e3a301d29cae4b24ca3a635c0c3c2a546e7436b4) | Electron 配置、桌面账号隔离与 API 池设计、README 当前维护说明 | Windows 桌面产品方向不同；账号池、网关、用量调度已属于 CPR 范围，不搬入 CPR Auth |
 

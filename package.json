@@ -10,9 +10,10 @@
     "daemon:restart": "pm2 restart cpr-auth --update-env",
     "daemon:stop": "pm2 stop cpr-auth",
     "daemon:logs": "pm2 logs cpr-auth",
-    "check": "node --check src/cpr-connector.mjs && node --check src/static-web.mjs && node test/cpr-connector.mjs && node test/cpr-access.mjs && node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/tls-transport.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs && node --check src/smsbower.mjs && node --check src/custom-sms.mjs && node --check src/sms-providers.mjs && node --check src/credential-store.mjs && node test/tls-transport.mjs && node test/credential-store.mjs && node test/sms-providers.mjs && node test/console-job-lock-smoke.mjs && node test/console-smoke.mjs && node test/console-restore-shutdown-smoke.mjs && node test/sms-provider-console-smoke.mjs && node test/protocol-smoke.mjs && node test/password-mfa-workspace-smoke.mjs",
+    "check": "node --check src/cpr-connector.mjs && node --check src/static-web.mjs && node test/cpr-connector.mjs && node test/cpr-access.mjs && node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/tls-transport.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs && node --check src/smsbower.mjs && node --check src/custom-sms.mjs && node --check src/sms-providers.mjs && node --check src/credential-store.mjs && node test/tls-transport.mjs && node test/credential-store.mjs && node test/sms-providers.mjs && node test/console-job-lock-smoke.mjs && node test/console-smoke.mjs && node test/console-restore-shutdown-smoke.mjs && node test/sms-provider-console-smoke.mjs && node test/protocol-smoke.mjs && node test/password-mfa-workspace-smoke.mjs && npm run test:rotation",
     "build": "vite build web",
-    "test:cpr": "node test/cpr-connector.mjs && node test/cpr-access.mjs"
+    "test:cpr": "node test/cpr-connector.mjs && node test/cpr-access.mjs",
+    "test:rotation": "node test/totp-rotation.mjs && node test/totp-rotation-integration.mjs"
   },
   "keywords": [
     "codex",
